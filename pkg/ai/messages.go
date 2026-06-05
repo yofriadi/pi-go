@@ -14,8 +14,8 @@ type Message interface {
 
 // UserMessage represents a message sent by the user.
 type UserMessage struct {
-	Content   any   `json:"content"` // string or []UserContent; required
-	Timestamp int64 `json:"timestamp"`         // Unix epoch milliseconds
+	Content   any   `json:"content"`   // string or []UserContent; required
+	Timestamp int64 `json:"timestamp"` // Unix epoch milliseconds
 }
 
 func (m UserMessage) messageRole() Role {

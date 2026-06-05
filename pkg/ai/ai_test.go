@@ -2,9 +2,12 @@ package ai
 
 import (
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 var _ Message = UserMessage{}
@@ -1308,4 +1311,615 @@ func TestAssistantMessageEventJSON(t *testing.T) {
 			t.Errorf("expected ToolCall detail, got %+v", roundTrip.ToolCall)
 		}
 	})
+}
+
+func TestAssistantStreamBasic(t *testing.T) {
+	s := NewAssistantStream(10)
+	events := s.Events() // Start the drain loop before pushing events
+
+	// Test basic push and consume
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	var received []AssistantMessageEvent
+	go func() {
+		defer wg.Done()
+		for ev := range events {
+			received = append(received, ev)
+		}
+	}()
+	err := s.Push(AssistantMessageEvent{Type: EventStart})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	err = s.Push(AssistantMessageEvent{Type: EventTextStart})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	err = s.Push(AssistantMessageEvent{
+		Type:  EventTextDelta,
+		Delta: "hello",
+	})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	finalMsg := AssistantMessage{
+		Model: "some-model",
+	}
+	err = s.Push(AssistantMessageEvent{
+		Type:    EventDone,
+		Message: &finalMsg,
+		Reason:  StopReasonStop,
+	})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	wg.Wait()
+
+	if len(received) != 4 {
+		t.Errorf("expected 4 events, got %d", len(received))
+	}
+
+	msg, err := s.Result()
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if msg.Model != "some-model" {
+		t.Errorf("expected model 'some-model', got %q", msg.Model)
+	}
+}
+
+func TestAssistantStreamError(t *testing.T) {
+	s := NewAssistantStream(10)
+	events := s.Events() // Start the drain loop before pushing events
+
+	err := s.Push(AssistantMessageEvent{Type: EventStart})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	partialMsg := AssistantMessage{
+		ErrorMessage: "something went wrong",
+	}
+	err = s.Push(AssistantMessageEvent{
+		Type:   EventError,
+		Error:  &partialMsg,
+		Reason: StopReasonError,
+	})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	// Consume to make sure we don't block
+	for range events {
+	}
+
+	msg, err := s.Result()
+	if err == nil {
+		t.Fatalf("expected non-nil error, got nil")
+	}
+	if err.Error() != "something went wrong" {
+		t.Errorf("expected error 'something went wrong', got %q", err.Error())
+	}
+	if msg.ErrorMessage != "something went wrong" {
+		t.Errorf("expected message ErrorMessage to be set")
+	}
+}
+
+func TestAssistantStreamNoOpAfterDone(t *testing.T) {
+	s := NewAssistantStream(10)
+
+	err := s.Push(AssistantMessageEvent{
+		Type:   EventDone,
+		Reason: StopReasonStop,
+	})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	// Any subsequent push should be a no-op
+	err = s.Push(AssistantMessageEvent{
+		Type:  EventTextDelta,
+		Delta: "should be ignored",
+	})
+	if err != nil {
+		t.Errorf("push after done should be a no-op and return nil, got %v", err)
+	}
+
+	// Drain the stream
+	var events []AssistantMessageEvent
+	for ev := range s.Events() {
+		events = append(events, ev)
+	}
+
+	if len(events) != 1 {
+		t.Errorf("expected only 1 event, got %d", len(events))
+	}
+}
+
+func TestAssistantStreamConcurrentResult(t *testing.T) {
+	s := NewAssistantStream(10)
+
+	var wg sync.WaitGroup
+	const numWaiters = 5
+
+	wg.Add(numWaiters)
+	for i := 0; i < numWaiters; i++ {
+		go func() {
+			defer wg.Done()
+			msg, err := s.Result()
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if msg.ResponseModel != "model-x" {
+				t.Errorf("unexpected response model: %s", msg.ResponseModel)
+			}
+		}()
+	}
+
+	s.End(&AssistantMessage{ResponseModel: "model-x"})
+
+	wg.Wait()
+}
+
+func TestAssistantStreamQueueOverflow(t *testing.T) {
+	// Create stream with a small queue limit
+	s := NewAssistantStream(2)
+	_ = s.Events() // Trigger lazy-start of the drain loop
+	// Since we are not reading from Events(), the drain loop is blocked trying to send the first event.
+	// The first event is popped from the queue and sent to eventsChan.
+	// The channel is unbuffered, so sending blocks.
+	// Then we push more events. They remain in the queue because the drain loop is blocked.
+	err := s.Push(AssistantMessageEvent{Type: EventStart}) // Popped and blocked on send
+	if err != nil {
+		t.Fatalf("first push failed: %v", err)
+	}
+
+	// Wait until the drain loop has popped the first event and is blocked on sending.
+	// We check the queue size under lock in a loop.
+	for i := 0; i < 100; i++ {
+		s.mu.Lock()
+		qLen := len(s.queue)
+		s.mu.Unlock()
+		if qLen == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Now we fill the queue to its limit (2)
+	err = s.Push(AssistantMessageEvent{Type: EventTextStart}) // Enqueued (queue size = 1)
+	if err != nil {
+		t.Fatalf("second push failed: %v", err)
+	}
+
+	err = s.Push(AssistantMessageEvent{Type: EventTextDelta}) // Enqueued (queue size = 2)
+	if err != nil {
+		t.Fatalf("third push failed: %v", err)
+	}
+
+	// The next push should exceed the queue limit and return a queue overflow error
+	err = s.Push(AssistantMessageEvent{Type: EventTextDelta})
+	if err == nil {
+		t.Errorf("expected queue overflow error, got nil")
+	} else if !strings.Contains(err.Error(), "queue overflow") {
+		t.Errorf("expected queue overflow error, got: %v", err)
+	}
+
+	// Drain the queue to prevent goroutine leak
+	go func() {
+		for range s.Events() {
+		}
+	}()
+
+	s.End(nil)
+}
+
+func TestAssistantStreamEndAndErrorDirect(t *testing.T) {
+	t.Run("End", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		s.End(&AssistantMessage{ResponseID: "resp-123"})
+
+		msg, err := s.Result()
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if msg.ResponseID != "resp-123" {
+			t.Errorf("expected ResponseID 'resp-123', got %q", msg.ResponseID)
+		}
+	})
+
+	t.Run("Error", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		customErr := errors.New("custom test error")
+		s.Error(customErr, &AssistantMessage{ResponseID: "resp-err"})
+
+		msg, err := s.Result()
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if !errors.Is(err, customErr) {
+			t.Errorf("expected customErr, got %v", err)
+		}
+		if msg.ResponseID != "resp-err" {
+			t.Errorf("expected ResponseID 'resp-err', got %q", msg.ResponseID)
+		}
+	})
+}
+
+func TestAssistantStreamStopReasonPartitioning(t *testing.T) {
+	t.Run("Valid Done Reasons", func(t *testing.T) {
+		reasons := []StopReason{StopReasonStop, StopReasonLength, StopReasonToolUse}
+		for _, reason := range reasons {
+			s := NewAssistantStream(10)
+			err := s.Push(AssistantMessageEvent{
+				Type:   EventDone,
+				Reason: reason,
+			})
+			if err != nil {
+				t.Errorf("expected valid done reason %q to be accepted, got %v", reason, err)
+			}
+		}
+	})
+
+	t.Run("Invalid Done Reasons", func(t *testing.T) {
+		reasons := []StopReason{StopReasonError, StopReasonAborted, StopReason("invalid")}
+		for _, reason := range reasons {
+			s := NewAssistantStream(10)
+			err := s.Push(AssistantMessageEvent{
+				Type:   EventDone,
+				Reason: reason,
+			})
+			if err == nil {
+				t.Errorf("expected invalid done reason %q to be rejected, got nil", reason)
+			}
+		}
+	})
+
+	t.Run("Valid Error Reasons", func(t *testing.T) {
+		reasons := []StopReason{StopReasonError, StopReasonAborted}
+		for _, reason := range reasons {
+			s := NewAssistantStream(10)
+			err := s.Push(AssistantMessageEvent{
+				Type:   EventError,
+				Reason: reason,
+			})
+			if err != nil {
+				t.Errorf("expected valid error reason %q to be accepted, got %v", reason, err)
+			}
+		}
+	})
+
+	t.Run("Invalid Error Reasons", func(t *testing.T) {
+		reasons := []StopReason{StopReasonStop, StopReasonLength, StopReasonToolUse, StopReason("invalid")}
+		for _, reason := range reasons {
+			s := NewAssistantStream(10)
+			err := s.Push(AssistantMessageEvent{
+				Type:   EventError,
+				Reason: reason,
+			})
+			if err == nil {
+				t.Errorf("expected invalid error reason %q to be rejected, got nil", reason)
+			}
+		}
+	})
+}
+
+func TestAssistantStreamSnapshotIsolation(t *testing.T) {
+	s := NewAssistantStream(10)
+	events := s.Events() // Trigger eventsWatched = true
+	// Prepare a message and a tool call with mutable slice and map
+	args := map[string]any{"key": "value"}
+	tc := &ToolCall{
+		ID:        "call-1",
+		Name:      "test",
+		Arguments: args,
+	}
+	content := []AssistantContent{tc}
+	msg := &AssistantMessage{
+		Content: content,
+	}
+
+	// Push the event
+	err := s.Push(AssistantMessageEvent{
+		Type:     EventToolCallEnd,
+		ToolCall: tc,
+		Partial:  msg,
+	})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	// Mutate the original map and slice immediately after push
+	args["key"] = "mutated"
+	tc.ID = "mutated-id"
+	content[0] = TextContent{Text: "mutated"}
+	msg.Model = "mutated-model"
+
+	// Now consume the event and check it was isolated
+	go func() {
+		s.End(nil)
+	}()
+
+	var ev AssistantMessageEvent
+	for e := range events {
+		if e.Type == EventToolCallEnd {
+			ev = e
+		}
+	}
+
+	// Assert the consumed event has the original unmutated values
+	if ev.ToolCall == nil {
+		t.Fatalf("expected tool call to be present")
+	}
+	if ev.ToolCall.ID != "call-1" {
+		t.Errorf("ToolCall ID was mutated: got %q, expected 'call-1'", ev.ToolCall.ID)
+	}
+	val, _ := ev.ToolCall.Arguments["key"].(string)
+	if val != "value" {
+		t.Errorf("ToolCall Arguments was mutated: got %q, expected 'value'", val)
+	}
+
+	if ev.Partial == nil {
+		t.Fatalf("expected partial message to be present")
+	}
+	if len(ev.Partial.Content) != 1 {
+		t.Fatalf("expected partial content length 1")
+	}
+	tcFromMsg, ok := ev.Partial.Content[0].(ToolCall)
+	if !ok {
+		t.Fatalf("expected content to be ToolCall, got %T", ev.Partial.Content[0])
+	}
+	if tcFromMsg.ID != "call-1" {
+		t.Errorf("message content ToolCall ID was mutated: got %q", tcFromMsg.ID)
+	}
+	if ev.Partial.Model != "" {
+		t.Errorf("message Model was mutated: got %q", ev.Partial.Model)
+	}
+}
+
+func TestAssistantStreamResultOnly(t *testing.T) {
+	s := NewAssistantStream(10)
+
+	// Simulate provider pushing some text deltas and then done without Events() being called
+	err := s.Push(AssistantMessageEvent{Type: EventStart})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	err = s.Push(AssistantMessageEvent{Type: EventTextStart})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	err = s.Push(AssistantMessageEvent{Type: EventTextDelta, Delta: "hello"})
+	if err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+
+	doneMsg := &AssistantMessage{
+		ResponseID: "done-123",
+	}
+	s.End(doneMsg)
+
+	// Verify Result resolves without hanging
+	res, err := s.Result()
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if res.ResponseID != "done-123" {
+		t.Errorf("expected ResponseID 'done-123', got %q", res.ResponseID)
+	}
+}
+
+func TestAssistantStreamEndErrorValidation(t *testing.T) {
+	t.Run("End normalizes invalid stop reason", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		s.End(&AssistantMessage{
+			StopReason: StopReasonError, // Invalid for successful done
+		})
+
+		msg, err := s.Result()
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if msg.StopReason != StopReasonStop {
+			t.Errorf("expected StopReason to be normalized to 'stop', got %q", msg.StopReason)
+		}
+	})
+
+	t.Run("Error normalizes invalid stop reason", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		s.Error(errors.New("fail"), &AssistantMessage{
+			StopReason: StopReasonStop, // Invalid for error
+		})
+
+		msg, err := s.Result()
+		if err == nil {
+			t.Fatalf("expected non-nil error")
+		}
+		if msg.StopReason != StopReasonError {
+			t.Errorf("expected StopReason to be normalized to 'error', got %q", msg.StopReason)
+		}
+	})
+}
+
+func TestAssistantStreamUnwatchedQueueOverflow(t *testing.T) {
+	s := NewAssistantStream(2)
+
+	if err := s.Push(AssistantMessageEvent{Type: EventStart}); err != nil {
+		t.Fatalf("first push failed: %v", err)
+	}
+	if err := s.Push(AssistantMessageEvent{Type: EventTextStart}); err != nil {
+		t.Fatalf("second push failed: %v", err)
+	}
+
+	err := s.Push(AssistantMessageEvent{Type: EventTextDelta, Delta: "overflow"})
+	if err == nil {
+		t.Fatalf("expected queue overflow error, got nil")
+	}
+	if !strings.Contains(err.Error(), "queue overflow") {
+		t.Fatalf("expected queue overflow error, got %v", err)
+	}
+
+	s.End(&AssistantMessage{ResponseID: "overflow-resp"})
+
+	res, err := s.Result()
+	if err != nil {
+		t.Fatalf("expected nil result error, got %v", err)
+	}
+	if res.ResponseID != "overflow-resp" {
+		t.Errorf("expected ResponseID 'overflow-resp', got %q", res.ResponseID)
+	}
+}
+
+func TestAssistantStreamTerminalPushWhenQueueFull(t *testing.T) {
+	t.Run("EventDone", func(t *testing.T) {
+		s := NewAssistantStream(2)
+
+		if err := s.Push(AssistantMessageEvent{Type: EventStart}); err != nil {
+			t.Fatalf("first push failed: %v", err)
+		}
+		if err := s.Push(AssistantMessageEvent{Type: EventTextStart}); err != nil {
+			t.Fatalf("second push failed: %v", err)
+		}
+
+		done := AssistantMessage{ResponseID: "done-when-full"}
+		if err := s.Push(AssistantMessageEvent{
+			Type:    EventDone,
+			Message: &done,
+			Reason:  StopReasonStop,
+		}); err != nil {
+			t.Fatalf("expected terminal push to succeed when queue is full, got %v", err)
+		}
+
+		msg, err := s.Result()
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if msg.ResponseID != "done-when-full" {
+			t.Fatalf("expected ResponseID %q, got %q", "done-when-full", msg.ResponseID)
+		}
+
+		var events []AssistantMessageEvent
+		for ev := range s.Events() {
+			events = append(events, ev)
+		}
+		if len(events) != 3 {
+			t.Fatalf("expected 3 events, got %d", len(events))
+		}
+		if events[2].Type != EventDone {
+			t.Fatalf("expected final event type %q, got %q", EventDone, events[2].Type)
+		}
+		if events[2].Reason != StopReasonStop {
+			t.Errorf("expected final event reason %q, got %q", StopReasonStop, events[2].Reason)
+		}
+		if events[2].Message == nil {
+			t.Errorf("expected final event Message to be non-nil")
+		} else if events[2].Message.ResponseID != "done-when-full" {
+			t.Errorf("expected final event Message ResponseID %q, got %q", "done-when-full", events[2].Message.ResponseID)
+		}
+	})
+
+	t.Run("EventError", func(t *testing.T) {
+		s := NewAssistantStream(2)
+
+		if err := s.Push(AssistantMessageEvent{Type: EventStart}); err != nil {
+			t.Fatalf("first push failed: %v", err)
+		}
+		if err := s.Push(AssistantMessageEvent{Type: EventTextStart}); err != nil {
+			t.Fatalf("second push failed: %v", err)
+		}
+
+		errPayload := AssistantMessage{
+			ResponseID:   "err-when-full",
+			ErrorMessage: "custom queue error",
+		}
+		if err := s.Push(AssistantMessageEvent{
+			Type:   EventError,
+			Error:  &errPayload,
+			Reason: StopReasonError,
+		}); err != nil {
+			t.Fatalf("expected terminal error push to succeed when queue is full, got %v", err)
+		}
+
+		msg, err := s.Result()
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if err.Error() != "custom queue error" {
+			t.Fatalf("expected error message 'custom queue error', got %q", err.Error())
+		}
+		if msg.ResponseID != "err-when-full" {
+			t.Fatalf("expected ResponseID %q, got %q", "err-when-full", msg.ResponseID)
+		}
+
+		var events []AssistantMessageEvent
+		for ev := range s.Events() {
+			events = append(events, ev)
+		}
+		if len(events) != 3 {
+			t.Fatalf("expected 3 events, got %d", len(events))
+		}
+		if events[2].Type != EventError {
+			t.Fatalf("expected final event type %q, got %q", EventError, events[2].Type)
+		}
+		if events[2].Reason != StopReasonError {
+			t.Errorf("expected final event reason %q, got %q", StopReasonError, events[2].Reason)
+		}
+		if events[2].Error == nil {
+			t.Errorf("expected final event Error to be non-nil")
+		} else if events[2].Error.ResponseID != "err-when-full" {
+			t.Errorf("expected final event Error ResponseID %q, got %q", "err-when-full", events[2].Error.ResponseID)
+		}
+	})
+}
+
+
+func TestAssistantStreamEventsAfterResult(t *testing.T) {
+	s := NewAssistantStream(10)
+
+	if err := s.Push(AssistantMessageEvent{Type: EventStart}); err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	if err := s.Push(AssistantMessageEvent{Type: EventTextStart}); err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	if err := s.Push(AssistantMessageEvent{Type: EventTextDelta, Delta: "a"}); err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	if err := s.Push(AssistantMessageEvent{Type: EventTextDelta, Delta: "b"}); err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	s.End(&AssistantMessage{ResponseModel: "model-y"})
+
+	res, err := s.Result()
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if res.ResponseModel != "model-y" {
+		t.Errorf("expected model-y, got %s", res.ResponseModel)
+	}
+
+	var events []AssistantMessageEvent
+	for ev := range s.Events() {
+		events = append(events, ev)
+	}
+
+	if len(events) != 5 {
+		t.Fatalf("expected 5 events, got %d", len(events))
+	}
+	want := []AssistantMessageEventType{
+		EventStart,
+		EventTextStart,
+		EventTextDelta,
+		EventTextDelta,
+		EventDone,
+	}
+	for i, typ := range want {
+		if events[i].Type != typ {
+			t.Errorf("event %d type = %q, want %q", i, events[i].Type, typ)
+		}
+	}
 }
