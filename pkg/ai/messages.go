@@ -85,9 +85,11 @@ func (t TextContent) toolResultContent() {}
 func (t TextContent) deepCopyUserContent() UserContent {
 	return TextContent{Text: t.Text, TextSignature: t.TextSignature}
 }
+
 func (t TextContent) deepCopyAssistantContent() AssistantContent {
 	return TextContent{Text: t.Text, TextSignature: t.TextSignature}
 }
+
 func (t TextContent) deepCopyToolResultContent() ToolResultContent {
 	return TextContent{Text: t.Text, TextSignature: t.TextSignature}
 }
@@ -143,6 +145,7 @@ func (i ImageContent) toolResultContent() {}
 func (i ImageContent) deepCopyUserContent() UserContent {
 	return ImageContent{Data: i.Data, MimeType: i.MimeType}
 }
+
 func (i ImageContent) deepCopyToolResultContent() ToolResultContent {
 	return ImageContent{Data: i.Data, MimeType: i.MimeType}
 }

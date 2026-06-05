@@ -1,502 +1,436 @@
-# Plan: Recreating Pi in Golang
+# PLAN: pi-go implementation roadmap
 
-This document is the technical roadmap for recreating `pi` in Go while intentionally narrowing the provider surface to the project policy in `AGENTS.md`: **OpenAI Codex** only. It follows the real TypeScript/Node/Bun `pi` architecture where that matters for compatibility, and chooses Go-native implementations where exact runtime parity would add unnecessary complexity.
+## Source requirements
 
-> [!IMPORTANT]
-> Provider integrations are intentionally constrained. Do **not** implement direct Anthropic, Google/Gemini, OpenAI usage-based API-key, Mistral, Bedrock, OpenRouter, Copilot, OpenCode, or other provider backends. OpenAI Codex is supported only through subscription/OAuth Codex flows, not pay-as-you-go OpenAI API keys.
+This plan consolidates `SPEC.md` and `RESEARCH.md` into the execution roadmap for recreating `pi` in Go.
 
----
+Objective: build a terminal-native Go coding agent that supports non-interactive print mode, branchable JSONL sessions, structured context compaction, an interactive retained-mode TUI, subprocess JSON-RPC extensions, and Agent Skills metadata execution.
 
-## High-Level Architectural Mapping
+Hard provider boundary:
+- Support only OpenAI Codex subscription/OAuth provider flows.
+- Public provider ID: `openai-codex`.
+- Required API dialect: `openai-codex-responses`.
+- Never add direct OpenAI API-key usage, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY`, Anthropic, Gemini, Mistral, Bedrock, OpenRouter, Copilot, OpenCode, provider aliases, or custom extension providers.
 
-```
-pi-go/
-├── go.mod
-├── cmd/
-│   └── pi/                  # CLI entrypoint, arg parsing, run modes
-└── pkg/
-    ├── ai/                  # Model registry, stream protocol, provider/API adapters
-    ├── agent/               # Agent loop, hooks, queues, compaction orchestration
-    ├── tools/               # Built-in coding tools and schemas
-    ├── session/             # Versioned JSONL tree persistence
-    └── tui/                 # Interactive terminal UI
-```
+Required commands:
+- Build: `go build -o bin/pi ./cmd/pi`
+- Test: `go test -v ./pkg/...`
+- Vet: `go vet ./pkg/...`
+- Format: `go fmt ./pkg/...`
+- Dev run: `go run ./cmd/pi`
 
-| TypeScript Area | Go Package/Directory | Go Direction |
-| :--- | :--- | :--- |
-| `packages/ai` | `pkg/ai` | `net/http`, SSE/WebSocket stream decoders, API-adapter registry |
-| `packages/agent` | `pkg/agent` | Context-aware loop, goroutines, channels, hooks, queue handling |
-| `packages/coding-agent/src/core/tools` | `pkg/tools` | `os`, `io/fs`, `os/exec`, `regexp`, optional managed `rg`/`fd` |
-| `packages/coding-agent/src/core/session-manager.ts` | `pkg/session` | Versioned newline-delimited JSON entries with `id`/`parentId` tree links |
-| `packages/tui` + interactive mode | `pkg/tui` | Go-native TUI; Bubble Tea is acceptable, but not exact parity with TypeScript Pi's custom renderer |
-| `packages/coding-agent/src/main.ts` | `cmd/pi` | Standard `flag` or Cobra; interactive, print, JSON/RPC modes over time |
+## Key findings from current repository
+
+Current code exists only under `pkg/ai` plus root project files. `go.mod` declares `go 1.25`.
 
----
-
-## Provider Constraint and Model Registry
-
-### Supported provider IDs
-
-Only expose this provider ID:
-
-- `openai-codex` — ChatGPT/Codex subscription OAuth integration only.
-
-Do not expose the broader upstream `pi` provider list. The Go implementation may internally reuse protocol dialect code, but public provider selection, environment variable handling, config, docs, tests, and model registry entries must be filtered to this provider.
-
-### Static filtered model registry (`pkg/ai`)
-
-Model metadata is core infrastructure, not a nice-to-have. Define or generate a compact registry containing only Codex entries:
-
-```go
-type Model struct {
-    ID               string
-    Name             string
-    Provider         ProviderID
-    API              APIID
-    BaseURL          string
-    Input            []InputKind // text, image
-    Reasoning        bool
-    ThinkingLevelMap map[ModelThinkingLevel]*string
-    Cost             ModelCost
-    ContextWindow    int
-    MaxTokens        int
-    Headers          map[string]string
-    Compat           any // API-specific compat shape; typed per-provider
-}
-```
-
-Required API dialects for the constrained provider set:
-
-- `openai-codex-responses` for Codex subscription/OAuth.
-
-Current upstream Codex registry entries are manually listed, not fetched from an external model catalog:
-
-- `gpt-5.3-codex-spark`
-- `gpt-5.4`
-- `gpt-5.4-mini`
-- `gpt-5.5`
-
-Keep this list explicit and reviewed. Do not expose OpenAI API-key `openai` models whose names contain "codex"; they are not the ChatGPT/Codex subscription provider.
-
----
-
-## Phase 1: Minimal Coding Agent
-
-*Goal: non-interactive `pi -p "..."` that streams assistant text/thinking, executes compatible tools, and exits when the agent reaches a natural stop.*
-
-### Step 1.1: Unified AI stream protocol (`pkg/ai`)
-
-Do not model the AI layer as one provider `Client`. Match Pi's API-adapter shape: dispatch by `model.API` to registered stream functions.
-
-Core types:
-
-```go
-type Context struct {
-    SystemPrompt string
-    Messages     []Message
-    Tools        []ToolDefinition // optional when no tools are exposed
-}
-
-type Message interface{ messageRole() Role }
-
-type UserMessage struct {
-    Content   any   `json:"content"` // string or []UserContent; required
-    Timestamp int64 `json:"timestamp"` // Unix epoch milliseconds
-}
-
-type AssistantMessage struct {
-    Content       []AssistantContent           `json:"content,omitempty"`
-    API           APIID                        `json:"api,omitempty"`
-    Provider      ProviderID                   `json:"provider,omitempty"`
-    Model         string                       `json:"model,omitempty"`
-    ResponseModel string                       `json:"responseModel,omitempty"`
-    ResponseID    string                       `json:"responseId,omitempty"`
-    Diagnostics   []AssistantMessageDiagnostic `json:"diagnostics,omitempty"`
-    Usage         Usage                        `json:"usage"`
-    StopReason    StopReason                   `json:"stopReason,omitempty"`
-    ErrorMessage  string                       `json:"errorMessage,omitempty"`
-    Timestamp     int64                        `json:"timestamp"` // Unix epoch milliseconds
-}
-
-type ToolResultMessage struct {
-    ToolCallID string              `json:"toolCallId"` // required
-    ToolName   string              `json:"toolName"`   // required
-    Content    []ToolResultContent `json:"content,omitempty"`
-    Details    any                  `json:"details,omitempty"`
-    IsError    bool                 `json:"isError,omitempty"`
-    Timestamp  int64                `json:"timestamp"` // Unix epoch milliseconds
-}
-```
-
-Content blocks:
-
-- `TextContent{text, textSignature}`
-- `ThinkingContent{thinking, thinkingSignature, redacted}`
-- `ImageContent{data, mimeType}`
-- `ToolCall{id, name, arguments, thoughtSignature}`
-
-Stream events must support partial updates, not just final messages:
-
-- `start`
-- `text_start`, `text_delta`, `text_end`
-- `thinking_start`, `thinking_delta`, `thinking_end`
-- `toolcall_start`, `toolcall_delta`, `toolcall_end`
-- `done`
-- `error`
-
-Expose four operations:
-
-```go
-type StreamFunc func(ctx context.Context, model Model, c Context, opts *StreamOptions) *AssistantStream
-
-func Stream(ctx context.Context, model Model, c Context, opts *StreamOptions) *AssistantStream
-func Complete(ctx context.Context, model Model, c Context, opts *StreamOptions) (AssistantMessage, error)
-func StreamSimple(ctx context.Context, model Model, c Context, opts *SimpleStreamOptions) *AssistantStream
-func CompleteSimple(ctx context.Context, model Model, c Context, opts *SimpleStreamOptions) (AssistantMessage, error)
-```
-
-`AssistantStream` should be a single object that supports iteration/channel consumption plus a final-result method, so callers can consume deltas and still retrieve the canonical final `AssistantMessage`. `Complete`/`CompleteSimple` are thin wrappers over that final-result method. `SimpleStreamOptions` should extend `StreamOptions` with reasoning level and optional thinking-budget overrides for models that support them.
-
-### Step 1.2: Provider/API implementations (`pkg/ai`)
-
-Implement only constrained provider access:
-
-#### OpenAI Codex
-
-- Authentication: OAuth/Codex subscription credentials only, loaded from the Pi auth store (`auth.json`) and refreshed through the OAuth provider flow. There is no upstream `CODEX_ACCESS_TOKEN` environment variable and no OpenAI pay-as-you-go API-key path.
-- The harness resolves a per-request bearer token through a `getApiKey(provider)` hook and passes it down as `StreamOptions.apiKey`. Keep the upstream field name `apiKey` even though project policy restricts its value to a Codex OAuth access token.
-- Support Codex stream transports:
-  - SSE first for MVP.
-  - WebSocket and WebSocket-cached once session reuse/prompt caching is implemented.
-- Preserve reasoning item IDs/signatures where returned so future turns can maintain continuity.
-
-`StreamOptions` should include at least:
-
-- temperature, max tokens, headers
-- `apiKey` containing the OAuth/Codex bearer token only; no OpenAI pay-as-you-go API-key source or fallback
-- transport (`sse`, `websocket`, `websocket-cached`, `auto`)
-- cache retention
-- session ID
-- request timeout / WebSocket connect timeout
-- retry limits, including maximum retry delay
-- metadata
-- debug hooks for inspecting provider payload/response in tests
-
-Codex-specific stream options should include:
-
-- `reasoningEffort`
-- `reasoningSummary`
-- `serviceTier`
-- `textVerbosity`
-
-Codex request handling should preserve upstream protocol details:
-
-- extract `chatgpt-account-id` from the OAuth access-token JWT
-- set `Authorization`, `chatgpt-account-id`, `originator: pi`, `User-Agent`, and transport-specific `OpenAI-Beta` headers
-- use an SSE response-header timeout
-- support WebSocket beta headers, session request IDs, cached WebSocket continuation state, and fallback to SSE after session-scoped WebSocket failures
-
-### Step 1.3: Core agent loop (`pkg/agent`)
-
-Recreate the real Pi loop shape from the start. Keep it small, but do not build an incompatible sequential-only loop.
-
-Required concepts:
-
-- `AgentMessage` superset for UI/custom messages.
-- Required `convertToLlm([]AgentMessage) []ai.Message` boundary before each provider request.
-- Context transform hook for compaction/pruning before conversion.
-- Streaming assistant partial updates forwarded as agent events.
-- Tool calls executed as a batch.
-- Parallel tool execution by default, with per-tool or global sequential mode.
-- In parallel mode, `tool_execution_end` events are emitted in completion order, while final tool-result messages are emitted in assistant source order.
-- Early termination only when all tool results in a batch carry `Terminate=true`.
-- Steering queue: user/system messages injected between turns while the agent is still working.
-- Follow-up queue: messages processed after the agent would otherwise stop.
-- Queue drain modes for both steering and follow-up queues: `"all"` vs. `"one-at-a-time"`.
-
-Core hooks:
-
-- `prepareNextTurn`
-- `shouldStopAfterTurn`
-- `beforeToolCall`
-- `afterToolCall`
-- `getSteeringMessages`
-- `getFollowUpMessages`
-- `getApiKey`
-
-### Step 1.4: Built-in tools (`pkg/tools`)
-
-Match Pi's built-in tool names and schemas unless there is a deliberate compatibility break.
-
-Required MVP tool set:
-
-- `read`
-  - path plus optional 1-indexed offset/limit.
-  - default truncation: 2000 lines and 50 KiB.
-  - no partial-line output except where explicitly documented.
-- `write`
-  - path plus full content.
-  - recursively create parent directories.
-- `edit`
-  - path plus `edits: [{ oldText, newText }]`.
-  - match against original file, not incrementally.
-  - reject overlapping/nested edits.
-  - preserve line endings.
-  - generate display diff/patch as result details.
-  - support JSON-string `edits` and legacy single-edit `{oldText, newText}` inputs for model compatibility.
-  - strip BOM before matching and restore it after writing.
-  - normalize CRLF/CR to LF for matching, then restore original line endings.
-  - implement upstream-style fuzzy matching for trailing whitespace and Unicode normalization (`NFKC`, smart quotes, Unicode dashes, special spaces).
-- `bash`
-  - command plus optional timeout in seconds; no hidden default timeout in schema.
-  - execute through platform shell.
-  - capture stdout/stderr together.
-  - support context cancellation and process-tree kill.
-  - use a streaming UTF-8 decoder, bounded rolling tail, and temp-file spooling for full output preservation.
-
-Optional early parity tools (opt-in only, do not expose to the model by default):
-
-- `grep`
-  - regex/literal pattern, optional path, glob, ignoreCase, literal, context, limit.
-  - Prefer managed `rg` for parity; a Go-regexp fallback is acceptable only if behavior is documented.
-- `find`
-  - pattern/path/limit.
-  - Prefer managed `fd`; Go filepath walking fallback is acceptable only if behavior is documented.
-- `ls`
-  - directory listing with limit.
-
-All tools should expose pluggable operation interfaces so local filesystem/shell behavior can later be replaced by remote execution or extensions without changing schemas. Agent-side tool definitions should also support per-tool execution-mode overrides when a tool must force sequential execution inside an otherwise parallel batch.
-
-### Step 1.5: CLI harness (`cmd/pi`)
-
-Initial flags:
-
-- `-p`, `--print`: non-interactive prompt and exit.
-- `--provider`: only `openai-codex`.
-- `--model`: model ID or provider/model selector from the filtered registry.
-- `--thinking`: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` where supported by the selected model.
-- `--tools`, `--exclude-tools`, `--no-tools`, `--no-builtin-tools`.
-- Additional parity-oriented flags/subcommands to plan for early: `--mode` (`text`, `json`, `rpc`), `--verbose`, `--version`, `--list-models`, `--system-prompt`, `--append-system-prompt`, `config` subcommand, `@file` args, model cycling via `--models`, extension flag passthrough for unknown `--flags`, `--export`, `--offline`, `--no-context-files`, `--extension` / `--no-extensions`, `--prompt-template` / `--no-prompt-templates`, `--theme` / `--no-themes`, `--skill` / `--no-skills`. Do not add `--api-key`; upstream has it, but this project intentionally forbids it because credential flow is OAuth/Codex subscription only. Do not add `--max-turns` for parity; upstream does not parse it.
-
-The print path should stream text and thinking distinctly to stdout/stderr or structured output, and should return a non-zero exit code only for real runtime failure, not for normal model/tool error messages encoded in the conversation.
-
----
-
-## Phase 2: Sessions, Branching, and Compaction
-
-*Goal: persist and restore whole coding sessions with branchable history and context-window management.*
-
-### Step 2.1: Versioned JSONL session tree (`pkg/session`)
-
-Use Pi-compatible tree entries, not a flat transcript.
-
-Session directory:
-
-- default: `~/.pi/agent/sessions`
-- env override: `PI_CODING_AGENT_SESSION_DIR`
-- agent dir override: `PI_CODING_AGENT_DIR`
-
-Header:
-
-```go
-type SessionHeader struct {
-    Type          string // "session"
-    Version       int    // current upstream version is 3
-    ID            string
-    Timestamp     time.Time
-    CWD           string
-    ParentSession string `json:"parentSession,omitempty"`
-}
-```
-
-Every session entry has tree links:
-
-```go
-type EntryBase struct {
-    Type      string
-    ID        string
-    ParentID  *string
-    Timestamp time.Time
-}
-```
-
-Required entry types:
-
-- `message`
-- `thinking_level_change`
-- `model_change`
-- `compaction`
-- `branch_summary`
-- `custom`
-- `custom_message`
-- `label`
-- `session_info`
-- `active_tools_change`
-- `leaf`
-
-Rebuild context by walking from selected leaf to root, then applying compaction and branch summary rules along that path.
-
-### Step 2.2: Resume, continue, and fork controls
-
-Implement:
-
-- `--session <id-or-path>`: load a specific session.
-- `--session-id <id>`: force ID for a new session.
-- `--session-dir <path>`: override session directory.
-- `--fork <id>` or `--fork`: branch from an existing/current session.
-- `--continue`, `-c`: continue previous session with an optional new prompt.
-- `--resume`, `-r`: resume session state.
-- `--name`, `-n`: set display name.
-- `--no-session`: run without persistence.
-
-Forking should preserve parent relationships through `parentSession` and/or entry `parentId`, but upstream also copies selected path entries into a new JSONL file. Store `parentSession` as the source session file path, not just an ID.
-
-### Step 2.3: Compaction
-
-Compaction must summarize rather than blindly truncate.
-
-Required behavior:
-
-- Estimate context size from latest assistant usage when available.
-- Fall back to chars/4 estimation for trailing messages.
-- Trigger compaction when estimated context exceeds `contextWindow - reserveTokens`.
-- Keep recent turns according to configurable `keepRecentTokens`.
-- Reserve output/summarization space via `reserveTokens`.
-- Choose turn-aware cut points; never leave tool results detached from their assistant tool call.
-- Generate a structured LLM summary with the current constrained model/provider.
-- If a previous compaction summary exists, update it instead of discarding prior summarized context.
-- Track read and modified file paths in compaction details.
-
-Default settings should mirror Pi's intent:
-
-```go
-type CompactionSettings struct {
-    Enabled          bool
-    ReserveTokens    int
-    KeepRecentTokens int
-}
-```
-
----
-
-## Phase 3: Interactive TUI
-
-*Goal: move from print mode to an interactive terminal application with streaming output, editable prompt input, tool status, session controls, and branch navigation.*
-
-The TypeScript Pi TUI is a custom differential renderer, not Bubble Tea. In Go, using Bubble Tea/Bubbles/Lipgloss is acceptable if we preserve user-visible behavior instead of exact internals.
-
-Required components:
-
-1. **Prompt editor**
-   - multi-line input
-   - history navigation
-   - word navigation
-   - paste handling with bracketed paste/paste markers where the terminal supports it
-   - undo/redo
-   - kill-ring behavior
-   - IME cursor marker / hardware cursor positioning
-   - optional autocomplete/slash commands
-2. **Streaming transcript viewer**
-   - assistant text streaming
-   - thinking/reasoning rendered distinctly
-   - tool call and tool result blocks
-   - markdown rendering
-   - diff rendering for edits
-3. **Tool execution UI**
-   - active tool indicators
-   - partial bash output updates
-   - expandable truncated output backed by full-output references
-4. **Footer/status bar**
-   - provider/model
-   - thinking level
-   - session ID/name
-   - git branch when available
-   - token/context estimate
-   - key hints
-5. **Session navigation**
-   - continue/resume/fork labels
-   - branch summary display when navigating divergent history
-6. **Overlay and selector infrastructure**
-   - overlay stack for modal components
-   - session selector and tree selector
-   - model/thinking/theme/config selectors
-   - extension-provided header/footer/editor widgets where supported by the chosen extension API
-
----
-
-## Phase 4: Resource Loading, Skills, and Extensions
-
-*Goal: reproduce Pi's extensibility where it is useful in Go, without accidentally adding unsupported provider paths.*
-
-### Step 4.1: Settings and resource loader
-
-Add a central resource loader responsible for:
-
-- settings from global/project scopes
-- model overrides, filtered to supported providers only
-- skills
-- prompt templates
-- themes
-- extension declarations
-- system-prompt fragments
-- diagnostics for invalid resources
-
-Prompt template parity requirements:
-
-- parse `argument-hint` frontmatter
-- support `$1`, `$2`, ... positional substitutions
-- support `$@` and `$ARGUMENTS` for all arguments
-- support `${@:N}` and `${@:N:L}` bash-style argument slices
-
-### Step 4.2: Skills
-
-Implement Agent Skills style loading:
-
-- default user path: `~/.pi/agent/skills`
-- default project path: `<cwd>/.pi/skills`
-- explicit `--skill <path>` overrides/additions
-- `--no-skills` disables default discovery
-- support `SKILL.md` skill roots
-- support direct `.md` skills in root directories
-- recurse for nested `SKILL.md`
-- respect `.gitignore`, `.ignore`, and `.fdignore`
-- validate frontmatter `name`, `description`, and `disable-model-invocation`
-- inject visible skills into the system prompt as XML metadata pointing to the skill file location
-
-### Step 4.3: Extensions
-
-Do not assume `goja` provides TypeScript Pi extension parity. TypeScript Pi loads real TS/JS modules through `jiti`; Go needs an explicit design choice.
-
-Preferred Go direction:
-
-- define a stable extension API around process/RPC boundaries or compiled Go plugins where supported;
-- allow extensions to register tools, commands, shortcuts, message renderers, prompt/system fragments, and custom UI widgets for header/footer/editor surfaces;
-- explicitly diverge from upstream `pi.registerProvider()`: TypeScript Pi lets extensions register providers, models, OAuth flows, and custom `streamSimple`, but pi-go must strictly forbid custom provider backends or adapters to enforce the `openai-codex` restriction;
-- keep extension state in `custom` and `custom_message` session entries;
-- expose lifecycle hooks equivalent to agent/session events.
-
-Embedded JavaScript may be added later for simple scripting, but it is not the default parity path.
-
----
-
-## Recommended Technology Stack
-
-- **CLI**: standard `flag` initially; Cobra only if subcommands become necessary.
-- **HTTP/SSE/WebSocket**: `net/http`; `nhooyr.io/websocket` or `gorilla/websocket` if WebSocket support is needed.
-- **JSON schema/tool params**: Go structs plus JSON Schema generation or checked handwritten schemas.
-- **TUI**: `github.com/charmbracelet/bubbletea`, `github.com/charmbracelet/bubbles`, `github.com/charmbracelet/lipgloss` as Go-native implementation choices.
-- **Markdown**: Glamour or a lighter custom renderer; choose based on streaming performance.
-- **Syntax highlighting**: Chroma where needed.
-- **Search tools**: managed `rg` and `fd` for parity, with documented Go fallbacks if unavailable.
-- **Token estimation**: usage-first; chars/4 fallback. Add tokenizer libraries only when they improve decisions for supported models.
-- **UUIDs**: UUIDv7-compatible generation for ordered session entries.
-
----
-
-## Non-Goals
-
-- No direct Anthropic, Google/Gemini, OpenAI API-key, Mistral, Bedrock, OpenRouter, GitHub Copilot, OpenCode, or other provider integrations.
-- No broad model catalog exposed at runtime.
-- No provider aliases that bypass the Codex constraint.
-- No hidden compatibility shims that accept unsupported provider credentials.
-- No fake extension support: extension APIs must either work end-to-end or stay unimplemented.
+### Completed work
+
+**Step 1.1 is complete.** All files below exist with passing tests (~2455 lines in `ai_test.go`):
+
+- `pkg/ai/ai.go`: core protocol identifiers (`Role`, `APIID`, `ProviderID`, `StopReason`, `ThinkingLevel`, `Transport`, `CacheRetention`), `Usage`, `UsageCost`, `Context` with polymorphic JSON, `ToolDefinition`, stream event types.
+- `pkg/ai/model.go`: `Model` struct, `GetSupportedThinkingLevels`, `ClampThinkingLevel`, `CalculateCost`, `ModelsAreEqual`.
+- `pkg/ai/options.go`: `StreamOptions` (with `APIKey`, `OnRequest`, `OnResponse`, `OnPayload` hooks), `SimpleStreamOptions`, `BuildBaseOptions`, `AdjustMaxTokensForThinking`, `ThinkingBudgets`.
+- `pkg/ai/stream.go`: `AssistantStream` with bounded push queue, drain goroutine, `Push`/`End`/`Error` producer API, `Events()`/`Result()` consumer API, deep-copy event isolation, stop-reason validation.
+- `pkg/ai/registry.go`: `RegisterApiProvider`, `GetApiProvider`, `GetApiProviders` (sorted), `ClearApiProviders`, API-mismatch guard wrapping, validation on registration.
+- `pkg/ai/dispatch.go`: `Stream`, `Complete`, `StreamSimple`, `CompleteSimple` dispatching by `model.API`.
+- `pkg/ai/messages.go`: `Message` interface, `UserMessage`, `AssistantMessage`, `ToolResultMessage`, content block types (`TextContent`, `ThinkingContent`, `ImageContent`, `ToolCall`), `AssistantMessageDiagnostic`, full custom JSON marshal/unmarshal with role injection, content type discrimination, and validation.
+- `pkg/ai/deepcopy.go`: deep-copy methods for all message and content types, recursive `deepCopyValue` for maps/slices.
+- `pkg/ai/ai_test.go`: table tests covering JSON round-trips, content type discrimination, deep-copy isolation, stream event ordering, Result() blocking, Push after done, concurrent Result(), queue overflow, registry dispatch, API-mismatch guard, stop-reason partitioning, and race detection.
+
+### Active work
+
+**Step 1.2 is the current active step.** A commit-oriented sub-step breakdown exists in `STEP-1-2.md` (8 sub-steps: model registry, provider surface, auth store, request shaping, SSE transport, stream assembly, end-to-end milestone, WebSocket follow-up). No Step 1.2 code has been written yet.
+
+### Missing top-level implementation areas from the spec
+
+- `cmd/pi`
+- `pkg/agent`
+- `pkg/tools`
+- `pkg/session`
+- `pkg/tui`
+- Codex OAuth/auth store and stream transport implementation (Step 1.2)
+- Static Codex model registry entries (Step 1.2)
+- Resource loader, skills, and extension RPC layer (Phase 4)
+
+## Architecture decisions
+
+Recommended approach: build in compatibility layers from the bottom up, preserving Pi-visible behavior while staying Go-native internally.
+
+Chosen decisions:
+- CLI: use standard `flag` initially; introduce Cobra only if subcommands become too cumbersome.
+- AI dispatch: keep API-adapter registry keyed by `model.API`, not a single provider client.
+- Provider scope: keep a static reviewed Codex-only model registry with `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.5`.
+- Transport: implement Codex SSE first; add `github.com/coder/websocket` for WebSocket and cached WebSocket support when session reuse is ready.
+- Sessions: use Pi-compatible version 3 JSONL tree entries, not flat transcripts.
+- Compaction: summarize with the active constrained model; use actual usage when available and chars/4 fallback otherwise.
+- Tools: implement `read`, `write`, `edit`, and `bash` first with pluggable operations. `grep`, `find`, and `ls` remain optional and must not be exposed by default.
+- Search tools: require `rg` and `fd`; fail explicitly if missing. Do not add Go-native fallback searches.
+- TUI: custom retained-mode differential renderer writing to stdout with ANSI cursor controls, backbuffer line comparisons, and synchronized output (`CSI ?2026h`/`CSI ?2026l`). Do not use Bubble Tea — the spec explicitly requires a custom renderer that preserves native terminal scrollback.
+- Extensions: prefer subprocess JSON-RPC. Explicitly forbid provider/model/OAuth registration through extensions.
+
+Tradeoff resolved: exact TypeScript runtime parity is not required when it adds complexity, but data shapes, CLI-visible behavior, session compatibility, tool schemas, and provider boundaries are compatibility-critical.
+
+## Implementation phases
+
+### Phase 1 — Minimal non-interactive coding agent
+
+Goal: `pi -p "..."` streams assistant text/thinking, executes tool batches, and exits at natural stop.
+
+#### Step 1.1 — Complete unified AI stream protocol in `pkg/ai`
+
+All files implemented and tested. See "Completed work" section above for details. Detailed sub-step breakdown in `STEP-1-1.md`.
+
+#### Step 1.2 — OpenAI Codex provider/API implementation
+
+Detailed commit-oriented sub-step breakdown in `STEP-1-2.md` (8 sub-steps). No code written yet.
+
+Modify/add:
+- `pkg/ai/codex.go`
+- `pkg/ai/codex_sse.go`
+- `pkg/ai/codex_ws.go` later
+- `pkg/ai/auth.go` or `pkg/auth` if separation becomes clearer
+- `pkg/ai/model_registry.go`
+- `pkg/ai/*_test.go`
+
+Requirements:
+- Register only `openai-codex-responses`.
+- Load OAuth/Codex auth from Pi `auth.json`; refresh atomically and securely.
+- Store credential directories as `0700`, files as `0600`.
+- Do not read `CODEX_ACCESS_TOKEN` or `OPENAI_API_KEY` as bypasses.
+- Preserve `StreamOptions.apiKey` name for per-request OAuth bearer token supplied by `getApiKey(provider)` hook.
+- Extract `chatgpt-account-id` from OAuth access-token JWT.
+- Set `Authorization`, `chatgpt-account-id`, `originator: pi`, `User-Agent`, and transport-specific `OpenAI-Beta` headers.
+- Implement SSE first with response-header timeout and robust event parsing.
+- Preserve reasoning item IDs/signatures.
+- Add WebSocket and cached WebSocket only after SSE path is stable.
+- Provide debug hooks for inspecting request payloads/responses in tests without logging secrets.
+
+Verification:
+- `httptest.Server` SSE tests for request payloads, headers, deltas, tool calls, errors, cancellation, and final result.
+- Auth tests for permissions, atomic write/refresh, malformed token handling, and no env-var bypass.
+- `go test -v ./pkg/ai`
+
+#### Step 1.3 — Core agent loop in `pkg/agent`
+
+Add:
+- `pkg/agent/agent.go`
+- `pkg/agent/events.go`
+- `pkg/agent/messages.go`
+- `pkg/agent/tools.go`
+- `pkg/agent/hooks.go`
+- `pkg/agent/queue.go`
+- `pkg/agent/*_test.go`
+
+Requirements:
+- Define `AgentMessage` superset for UI/custom messages.
+- Convert through `convertToLlm([]AgentMessage) []ai.Message` before every provider request.
+- Add context transform hook for compaction/pruning.
+- Forward streaming assistant partial updates as agent events.
+- Execute tool calls as batches.
+- Run tools in parallel by default, unless global/per-tool sequential mode requires ordering.
+- Emit `tool_execution_end` in completion order for parallel execution.
+- Append final tool-result messages in assistant source order.
+- Terminate early only when all tool results in a batch have `Terminate=true`.
+- Support steering and follow-up queues.
+- Support queue drain modes `all` and `one-at-a-time`.
+- Hooks: `prepareNextTurn`, `shouldStopAfterTurn`, `beforeToolCall`, `afterToolCall`, `getSteeringMessages`, `getFollowUpMessages`, `getApiKey`.
+
+Verification:
+- Tests with fake local stream functions and local tool spies, not third-party mocking frameworks.
+- Cover parallel completion order vs final result order, sequential override, all-terminate rule, steering insertion, follow-up drain modes, cancellation, and hook errors.
+- `go test -v ./pkg/agent ./pkg/ai`
+
+#### Step 1.4 — Built-in tools in `pkg/tools`
+
+Add:
+- `pkg/tools/tools.go`
+- `pkg/tools/read.go`
+- `pkg/tools/write.go`
+- `pkg/tools/edit.go`
+- `pkg/tools/bash.go`
+- `pkg/tools/schema.go`
+- `pkg/tools/*_test.go`
+
+Requirements:
+- Tool definitions match Pi names and schemas unless deliberately documented.
+- Use pluggable operation interfaces for filesystem and shell execution.
+- `read`: path, optional 1-indexed offset/limit, default truncation 2000 lines and 50 KiB.
+- `write`: full content, recursively create parents.
+- `edit`: `edits: [{oldText,newText}]`, JSON-string `edits`, legacy single edit, match original file, reject overlapping/nested edits, preserve line endings, strip/restore BOM, CRLF/CR normalization for matching, upstream-style fuzzy matching for trailing whitespace and Unicode normalization, emit diff/patch details.
+- `bash`: platform shell, optional timeout in seconds, no hidden schema timeout, merged stdout/stderr, cancellation and process-tree kill, streaming UTF-8 decoder, bounded rolling tail, temp-file spooling for full output.
+- Optional `grep`, `find`, `ls` stay opt-in and not exposed by default.
+
+Verification:
+- Table tests for offsets/limits/truncation, parent creation, exact/fuzzy edits, overlap rejection, BOM and line-ending preservation, Unicode normalization, bash timeout/cancellation, process kill, UTF-8 boundary handling, and full-output spooling.
+- `go test -v ./pkg/tools`
+
+#### Step 1.5 — CLI harness in `cmd/pi`
+
+Add:
+- `cmd/pi/main.go`
+- `cmd/pi/flags.go`
+- `cmd/pi/print.go`
+- `cmd/pi/*_test.go` if package split allows
+
+Requirements:
+- Implement `-p` and `--print` non-interactive mode.
+- Implement `--provider`, accepting only `openai-codex`.
+- Implement `--model` using Codex-only registry.
+- Implement `--thinking` with `off`, `minimal`, `low`, `medium`, `high`, `xhigh` where supported.
+- Implement `--tools`, `--exclude-tools`, `--no-tools`, `--no-builtin-tools`.
+- Plan for but do not overbuild: `--mode`, `--verbose`, `--version`, `--list-models`, `--system-prompt`, `--append-system-prompt`, `config`, `@file`, `--models`, unknown extension flag passthrough, `--export`, `--offline`, `--no-context-files`, extension/template/theme/skill toggles.
+- Do not add `--api-key`.
+- Do not add `--max-turns`.
+- Print path streams text and thinking distinctly to stdout/stderr or structured output.
+- Return non-zero only for runtime failure, not normal model/tool error messages represented in conversation.
+
+Verification:
+- CLI tests for flag parsing, provider rejection, forbidden flags absence, model selection, thinking clamp, tool include/exclude behavior, and print-mode exit-code semantics.
+- `go test -v ./cmd/pi ./pkg/...`
+- `go build -o bin/pi ./cmd/pi`
+
+### Phase 2 — Sessions, branching, and compaction
+
+Goal: persist and restore branchable session history with context-window management.
+
+#### Step 2.1 — Versioned JSONL session tree
+
+Add:
+- `pkg/session/session.go`
+- `pkg/session/entry.go`
+- `pkg/session/store.go`
+- `pkg/session/tree.go`
+- `pkg/session/context.go`
+- `pkg/session/*_test.go`
+
+Requirements:
+- Default session dir: `~/.pi/agent/sessions`.
+- Env overrides: `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`.
+- Header version 3 with `type=session`, `id`, timestamp, cwd, optional `parentSession`.
+- Entries contain `type`, `id`, `parentId`, timestamp.
+- Entry types: `message`, `thinking_level_change`, `model_change`, `compaction`, `branch_summary`, `custom`, `custom_message`, `label`, `session_info`, `active_tools_change`, `leaf`.
+- Rebuild context by walking selected leaf to root and applying compaction/branch summary rules.
+
+Verification:
+- Tests for append/load, tree reconstruction, leaf selection, path walking, malformed JSONL errors, branch summaries, and compaction entry application.
+- `go test -v ./pkg/session`
+
+#### Step 2.2 — Resume, continue, fork controls
+
+Modify/add:
+- `cmd/pi/flags.go`
+- `cmd/pi/session.go`
+- `pkg/session/*`
+
+Requirements:
+- `--session <id-or-path>`
+- `--session-id <id>`
+- `--session-dir <path>`
+- `--fork <id>` and `--fork`
+- `--continue`, `-c`
+- `--resume`, `-r`
+- `--name`, `-n`
+- `--no-session`
+- Forking preserves parent relationships and stores `parentSession` as source session file path.
+- Upstream-like fork copies selected path entries into new JSONL file.
+
+Verification:
+- Tests for session discovery, explicit path/id load, continue previous, resume state, fork by ID/current leaf, no-session mode, parentSession path preservation.
+- `go test -v ./pkg/session ./cmd/pi`
+
+#### Step 2.3 — Context compaction
+
+Add:
+- `pkg/session/compaction.go` or `pkg/agent/compaction.go`
+- tests in owning package
+
+Requirements:
+- Estimate from latest assistant usage where available.
+- Fall back to chars/4 for trailing messages.
+- Trigger when context exceeds `contextWindow - reserveTokens`.
+- Keep recent turns according to `keepRecentTokens`.
+- Reserve output/summarization space with `reserveTokens`.
+- Cut on turn-aware boundaries; never detach tool results from assistant tool calls.
+- Generate structured summary through active constrained model/provider.
+- Update previous compaction summary when present.
+- Track read and modified file paths in details.
+
+Verification:
+- Tests for threshold behavior, usage vs chars/4 fallback, turn-safe cuts, prior-summary update, file-path tracking, and no orphaned tool results.
+- `go test -v ./pkg/session ./pkg/agent`
+
+### Phase 3 — Interactive TUI
+
+Goal: interactive terminal app with streaming output, editable prompt input, tool status, session controls, and branch navigation.
+
+Add:
+- `pkg/tui/renderer.go`
+- `pkg/tui/component.go`
+- `pkg/tui/transcript.go`
+- `pkg/tui/editor.go`
+- `pkg/tui/tools.go`
+- `pkg/tui/status.go`
+- `pkg/tui/overlay.go`
+- `pkg/tui/session.go`
+- `cmd/pi/interactive.go`
+- `pkg/tui/*_test.go`
+
+Requirements:
+- Retained-mode differential renderer writing to stdout.
+- Preserve native terminal scrollback.
+- Use ANSI cursor controls and synchronized output sequences `CSI ?2026h` / `CSI ?2026l` to prevent flicker.
+- Prompt editor: multiline input, history, word navigation, bracketed paste, undo/redo, kill-ring, IME/hardware cursor positioning, optional autocomplete/slash commands.
+- Transcript: streaming assistant text, distinct thinking, tool call/result blocks, markdown rendering, edit diff rendering.
+- Tool UI: active indicators, partial bash updates, expandable truncated output backed by full-output references.
+- Status bar: provider/model, thinking level, session ID/name, git branch, token/context estimate, key hints.
+- Session navigation: continue/resume/fork labels and branch summaries.
+- Overlay stack: session/tree/model/thinking/theme/config selectors and extension-provided widgets when extension API supports them.
+
+Verification:
+- Renderer golden tests for diff output and synchronized output wrapping.
+- Component tests for editor state transitions, transcript streaming updates, tool status lifecycle, and overlay stack behavior.
+- Manual smoke: `go run ./cmd/pi` in a terminal after automated tests pass.
+- `go test -v ./pkg/tui ./cmd/pi`
+
+### Phase 4 — Resource loading, skills, and extensions
+
+Goal: reproduce useful extensibility without allowing unsupported provider paths.
+
+#### Step 4.1 — Settings and resource loader
+
+Add:
+- `pkg/resource/loader.go`
+- `pkg/resource/settings.go`
+- `pkg/resource/templates.go`
+- `pkg/resource/diagnostics.go`
+- `pkg/resource/*_test.go`
+
+Requirements:
+- Load settings from global/project scopes.
+- Filter model overrides to supported provider only.
+- Load skills, prompt templates, themes, extension declarations, system-prompt fragments.
+- Report diagnostics for invalid resources.
+- Prompt templates: frontmatter `argument-hint`, `$1`, `$2`, `$@`, `$ARGUMENTS`, `${@:N}`, `${@:N:L}`.
+
+Verification:
+- Tests for global/project precedence, provider filtering, diagnostics, prompt-template substitutions and slices.
+- `go test -v ./pkg/resource`
+
+#### Step 4.2 — Agent Skills
+
+Modify/add:
+- `pkg/resource/skills.go`
+- `pkg/agent/skills.go`
+
+Requirements:
+- Default user path: `~/.pi/agent/skills`.
+- Default project path: `<cwd>/.pi/skills`.
+- `--skill <path>` overrides/additions.
+- `--no-skills` disables default discovery.
+- Support `SKILL.md` roots and direct `.md` skills.
+- Recurse nested `SKILL.md`.
+- Respect `.gitignore`, `.ignore`, `.fdignore`.
+- Validate frontmatter `name`, `description`, `disable-model-invocation`.
+- Inject visible skills into system prompt as XML metadata pointing to skill file location.
+
+Verification:
+- Tests with temp skill directories, nested skills, ignore files, invalid frontmatter, disabled skills, explicit overrides, and system-prompt XML injection.
+- `go test -v ./pkg/resource ./pkg/agent`
+
+#### Step 4.3 — Subprocess JSON-RPC extensions
+
+Add:
+- `pkg/extension/rpc.go`
+- `pkg/extension/process.go`
+- `pkg/extension/registry.go`
+- `pkg/extension/session.go`
+- `pkg/extension/*_test.go`
+
+Requirements:
+- Stable subprocess/IPC JSON-RPC interface.
+- Extensions may register tools, commands, shortcuts, message renderers, prompt/system fragments, and UI widgets for header/footer/editor surfaces.
+- Extensions must not register providers, models, OAuth flows, or custom stream functions.
+- Extension state uses `custom` and `custom_message` session entries.
+- Expose lifecycle hooks equivalent to agent/session events.
+- Embedded JavaScript is deferred; no fake extension support.
+
+Verification:
+- Tests for JSON-RPC handshake, tool registration/calls, lifecycle events, session custom entries, process shutdown, and rejection of provider/model/OAuth registration attempts.
+- `go test -v ./pkg/extension ./pkg/session ./pkg/agent`
+
+## Critical files and directories to modify
+
+Existing:
+- `go.mod`
+- `pkg/ai/ai.go`
+- `pkg/ai/messages.go`
+- `pkg/ai/model.go`
+- `pkg/ai/options.go`
+- `pkg/ai/stream.go`
+- `pkg/ai/registry.go`
+- `pkg/ai/dispatch.go`
+- `pkg/ai/deepcopy.go`
+- `pkg/ai/ai_test.go`
+
+New:
+- `cmd/pi/`
+- `pkg/agent/`
+- `pkg/tools/`
+- `pkg/session/`
+- `pkg/tui/`
+- `pkg/resource/`
+- `pkg/extension/`
+
+Potential external dependencies requiring explicit review before adding:
+- `github.com/coder/websocket`
+- `github.com/google/uuid`
+- `github.com/alecthomas/chroma`
+- TUI/markdown packages only if chosen later after measuring complexity/performance.
+
+## Cross-cutting constraints
+
+- Go 1.25 (per `go.mod`; spec says 1.21+ minimum, but project uses latest).
+- Idiomatic, concurrent Go; avoid unnecessary allocations and copies.
+- Standard `testing` package; no third-party mocking frameworks.
+- Prefer `httptest.Server` and local spies for integration tests.
+- Context cancellation must avoid orphaned goroutines/processes.
+- Do not log credentials/secrets.
+- Release cross-process locks on success and error paths.
+- Run full tests before committing.
+- Keep APIs boring and explicit; delete obsolete code instead of preserving aliases.
+
+## Final verification matrix
+
+Run by phase as features land:
+- `go test -v ./pkg/ai`
+- `go test -v ./pkg/agent ./pkg/ai`
+- `go test -v ./pkg/tools`
+- `go test -v ./cmd/pi ./pkg/...`
+- `go test -v ./pkg/session ./cmd/pi`
+- `go test -v ./pkg/tui ./cmd/pi`
+- `go test -v ./pkg/resource ./pkg/agent`
+- `go test -v ./pkg/extension ./pkg/session ./pkg/agent`
+
+Final gates:
+- `go fmt ./pkg/... ./cmd/...`
+- `go vet ./pkg/... ./cmd/...`
+- `go test -v ./pkg/... ./cmd/...`
+- `go build -o bin/pi ./cmd/pi`
+
+Manual smoke after automated gates:
+- `go run ./cmd/pi --list-models` shows only Codex models.
+- `go run ./cmd/pi -p "..."` streams output and runs tools to natural stop using OAuth/Codex credentials.
+- `go run ./cmd/pi` starts interactive TUI without corrupting scrollback.
+
+## Remaining todos
+
+1. Finish `pkg/ai` protocol parity.
+2. **Implement Codex provider: model registry, registration, auth store, request shaping, SSE transport, stream assembly, end-to-end milestone** (Step 1.2, sub-steps 1.2.1–1.2.7 in `STEP-1-2.md`).
+3. Implement Codex WebSocket and cached-WebSocket transport (Step 1.2.8 in `STEP-1-2.md`).
+4. Build `pkg/agent` loop with parallel tool batches and queues (Step 1.3).
+5. Build MVP tools: `read`, `write`, `edit`, `bash` (Step 1.4).
+6. Build `cmd/pi` print-mode CLI (Step 1.5).
+7. Add versioned JSONL sessions, resume/continue/fork, and compaction (Phase 2).
+8. Add custom retained-mode TUI (Phase 3).
+9. Add resource loader, skills, and subprocess JSON-RPC extensions (Phase 4).
+10. Run final verification matrix and fix failures at source.

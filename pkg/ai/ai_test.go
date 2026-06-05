@@ -11,9 +11,11 @@ import (
 	"time"
 )
 
-var _ Message = UserMessage{}
-var _ Message = AssistantMessage{}
-var _ Message = ToolResultMessage{}
+var (
+	_ Message = UserMessage{}
+	_ Message = AssistantMessage{}
+	_ Message = ToolResultMessage{}
+)
 
 func TestJSONRoundTrip(t *testing.T) {
 	// 1. UserMessage with string content
@@ -418,7 +420,6 @@ func TestContentBlockTypeDiscrimination(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected error when unmarshalling unknown content block type in ToolResultMessage, got nil")
 	}
-
 
 	// Verify type of ToolCall in JSON
 	tc := ToolCall{ID: "1", Name: "test", Arguments: map[string]any{}}
