@@ -6,35 +6,56 @@ import (
 
 // StreamOptions contains request parameter options for provider streaming.
 type StreamOptions struct {
-	Temperature               *float64
-	MaxTokens                 *int
-	APIKey                    string // OAuth/subscription bearer token; upstream-compatible field name
-	Headers                   map[string]string
-	Transport                 Transport
-	CacheRetention            CacheRetention
-	SessionID                 string
-	TimeoutMs                 *int
+	// Temperature controls randomness of the generated tokens.
+	Temperature *float64
+	// MaxTokens is the maximum number of tokens to generate in the completion.
+	MaxTokens *int
+	// APIKey is the OAuth/subscription bearer token (upstream-compatible field name).
+	APIKey string
+	// Headers contains custom HTTP headers to pass to the provider request.
+	Headers map[string]string
+	// Transport defines the delivery mechanism (e.g. sse, websocket).
+	Transport Transport
+	// CacheRetention defines the prompt cache retention strategy (none, short, long).
+	CacheRetention CacheRetention
+	// SessionID is the unique identifier for the streaming session.
+	SessionID string
+	// TimeoutMs is the timeout in milliseconds for the HTTP request.
+	TimeoutMs *int
+	// WebsocketConnectTimeoutMs is the timeout in milliseconds for websocket connection establishment.
 	WebsocketConnectTimeoutMs *int
-	MaxRetries                *int
-	MaxRetryDelayMs           *int
-	Metadata                  map[string]any
-	OnRequest                 func(*http.Request, []byte)                                               `json:"-"`
-	OnResponse                func(*http.Response)                                                      `json:"-"`
-	OnPayload                 func(payload any, model Model) (replaced any, didReplace bool, err error) `json:"-"`
+	// MaxRetries is the maximum number of retry attempts for failed requests.
+	MaxRetries *int
+	// MaxRetryDelayMs is the maximum delay in milliseconds between retries.
+	MaxRetryDelayMs *int
+	// Metadata contains optional arbitrary metadata for the request.
+	Metadata map[string]any
+	// OnRequest is a callback triggered before sending the HTTP request.
+	OnRequest func(*http.Request, []byte) `json:"-"`
+	// OnResponse is a callback triggered after receiving the HTTP response.
+	OnResponse func(*http.Response) `json:"-"`
+	// OnPayload is a callback for mutating or inspecting raw payload events.
+	OnPayload func(payload any, model Model) (replaced any, didReplace bool, err error) `json:"-"`
 }
 
-// ThinkingBudgets configures custom token limits for reasoning levels.
+// ThinkingBudgets configures custom token limits for reasoning/thinking levels.
 type ThinkingBudgets struct {
+	// Minimal budget for thinking tokens.
 	Minimal *int
-	Low     *int
-	Medium  *int
-	High    *int
+	// Low budget for thinking tokens.
+	Low *int
+	// Medium budget for thinking tokens.
+	Medium *int
+	// High budget for thinking tokens.
+	High *int
 }
 
 // SimpleStreamOptions wraps StreamOptions with thinking-budget parameters.
 type SimpleStreamOptions struct {
 	StreamOptions
-	Reasoning       ModelThinkingLevel
+	// Reasoning defines the desired thinking/reasoning level.
+	Reasoning ModelThinkingLevel
+	// ThinkingBudgets configures custom token limits for reasoning levels.
 	ThinkingBudgets *ThinkingBudgets
 }
 
