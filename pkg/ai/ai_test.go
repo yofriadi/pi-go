@@ -1125,3 +1125,187 @@ func TestUnmarshalRequiredFields(t *testing.T) {
 		}
 	})
 }
+
+func TestAssistantMessageEventJSON(t *testing.T) {
+	t.Run("EventTextDelta with ContentIndex 0", func(t *testing.T) {
+		index := 0
+		event := AssistantMessageEvent{
+			Type:         EventTextDelta,
+			ContentIndex: &index,
+			Delta:        "hello",
+			Partial: &AssistantMessage{
+				Content: []AssistantContent{
+					TextContent{Text: "hello"},
+				},
+				Timestamp: 1700000000000,
+			},
+		}
+
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		if raw["type"] != "text_delta" {
+			t.Errorf("expected type 'text_delta', got %v", raw["type"])
+		}
+		if raw["delta"] != "hello" {
+			t.Errorf("expected delta 'hello', got %v", raw["delta"])
+		}
+		if raw["contentIndex"] != float64(0) {
+			t.Errorf("expected contentIndex to be 0, got %v", raw["contentIndex"])
+		}
+
+		var roundTrip AssistantMessageEvent
+		if err := json.Unmarshal(data, &roundTrip); err != nil {
+			t.Fatalf("failed to unmarshal round-trip: %v", err)
+		}
+		if roundTrip.ContentIndex == nil || *roundTrip.ContentIndex != 0 {
+			t.Errorf("expected ContentIndex 0, got %v", roundTrip.ContentIndex)
+		}
+	})
+
+	t.Run("EventStart omitting ContentIndex", func(t *testing.T) {
+		event := AssistantMessageEvent{
+			Type: EventStart,
+			Partial: &AssistantMessage{
+				Timestamp: 1700000000000,
+			},
+		}
+
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		if _, exists := raw["contentIndex"]; exists {
+			t.Errorf("expected contentIndex to be omitted for start event")
+		}
+
+		var roundTrip AssistantMessageEvent
+		if err := json.Unmarshal(data, &roundTrip); err != nil {
+			t.Fatalf("failed to unmarshal round-trip: %v", err)
+		}
+		if roundTrip.ContentIndex != nil {
+			t.Errorf("expected ContentIndex to be nil, got %v", roundTrip.ContentIndex)
+		}
+		if roundTrip.Partial == nil {
+			t.Fatalf("expected round-tripped Partial")
+		}
+	})
+
+	t.Run("EventDone omitting ContentIndex", func(t *testing.T) {
+		event := AssistantMessageEvent{
+			Type: EventDone,
+			Message: &AssistantMessage{
+				Content: []AssistantContent{
+					TextContent{Text: "final response"},
+				},
+				StopReason: StopReasonStop,
+				Timestamp:  1700000000000,
+			},
+			Reason: StopReasonStop,
+		}
+
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		if _, exists := raw["contentIndex"]; exists {
+			t.Errorf("expected contentIndex to be omitted for done event")
+		}
+
+		var roundTrip AssistantMessageEvent
+		if err := json.Unmarshal(data, &roundTrip); err != nil {
+			t.Fatalf("failed to unmarshal round-trip: %v", err)
+		}
+		if roundTrip.ContentIndex != nil {
+			t.Errorf("expected ContentIndex to be nil, got %v", roundTrip.ContentIndex)
+		}
+		if roundTrip.Message == nil || len(roundTrip.Message.Content) != 1 {
+			t.Fatalf("expected round-tripped Message")
+		}
+	})
+
+	t.Run("EventError with Error and StopReason", func(t *testing.T) {
+		event := AssistantMessageEvent{
+			Type: EventError,
+			Error: &AssistantMessage{
+				ErrorMessage: "some timeout",
+				StopReason:   StopReasonError,
+				Timestamp:    1700000000000,
+			},
+			Reason: StopReasonError,
+		}
+
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("failed to unmarshal: %v", err)
+		}
+
+		if raw["reason"] != "error" {
+			t.Errorf("expected reason 'error', got %v", raw["reason"])
+		}
+
+		var roundTrip AssistantMessageEvent
+		if err := json.Unmarshal(data, &roundTrip); err != nil {
+			t.Fatalf("failed to unmarshal round-trip: %v", err)
+		}
+		if roundTrip.Error == nil || roundTrip.Error.ErrorMessage != "some timeout" {
+			t.Errorf("expected Error payload")
+		}
+		if roundTrip.Reason != StopReasonError {
+			t.Errorf("expected Reason StopReasonError")
+		}
+	})
+
+	t.Run("EventToolCallEnd with ToolCall", func(t *testing.T) {
+		index := 1
+		event := AssistantMessageEvent{
+			Type:         EventToolCallEnd,
+			ContentIndex: &index,
+			ToolCall: &ToolCall{
+				ID:        "call-abc",
+				Name:      "web_search",
+				Arguments: map[string]any{"query": "antigravity"},
+			},
+		}
+
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("failed to marshal: %v", err)
+		}
+
+		var roundTrip AssistantMessageEvent
+		if err := json.Unmarshal(data, &roundTrip); err != nil {
+			t.Fatalf("failed to unmarshal round-trip: %v", err)
+		}
+		if roundTrip.ContentIndex == nil || *roundTrip.ContentIndex != 1 {
+			t.Errorf("expected ContentIndex 1, got %v", roundTrip.ContentIndex)
+		}
+		if roundTrip.ToolCall == nil || roundTrip.ToolCall.ID != "call-abc" || roundTrip.ToolCall.Name != "web_search" {
+			t.Errorf("expected ToolCall detail, got %+v", roundTrip.ToolCall)
+		}
+	})
+}

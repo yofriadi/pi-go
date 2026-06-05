@@ -204,3 +204,55 @@ func unmarshalMessage(data []byte) (Message, error) {
 		return nil, fmt.Errorf("unknown role %q in message", roleDetector.Role)
 	}
 }
+
+// AssistantMessageEventType defines the type of a stream event.
+type AssistantMessageEventType string
+
+const (
+	// EventStart indicates the start of the assistant response.
+	EventStart AssistantMessageEventType = "start"
+	// EventTextStart indicates that a text content block is starting.
+	EventTextStart AssistantMessageEventType = "text_start"
+	// EventTextDelta indicates a text block incremental chunk (delta).
+	EventTextDelta AssistantMessageEventType = "text_delta"
+	// EventTextEnd indicates that a text content block has completed.
+	EventTextEnd AssistantMessageEventType = "text_end"
+	// EventThinkingStart indicates that a thinking content block is starting.
+	EventThinkingStart AssistantMessageEventType = "thinking_start"
+	// EventThinkingDelta indicates a thinking block incremental chunk (delta).
+	EventThinkingDelta AssistantMessageEventType = "thinking_delta"
+	// EventThinkingEnd indicates that a thinking content block has completed.
+	EventThinkingEnd AssistantMessageEventType = "thinking_end"
+	// EventToolCallStart indicates that a tool call is starting.
+	EventToolCallStart AssistantMessageEventType = "toolcall_start"
+	// EventToolCallDelta indicates a tool call block incremental chunk (delta).
+	EventToolCallDelta AssistantMessageEventType = "toolcall_delta"
+	// EventToolCallEnd indicates that a tool call block has completed.
+	EventToolCallEnd AssistantMessageEventType = "toolcall_end"
+	// EventDone indicates the successful completion of the stream.
+	EventDone AssistantMessageEventType = "done"
+	// EventError indicates that a stream error has occurred.
+	EventError AssistantMessageEventType = "error"
+)
+
+// AssistantMessageEvent represents a single event in the streaming protocol.
+type AssistantMessageEvent struct {
+	// Type is the event discriminator.
+	Type AssistantMessageEventType `json:"type"`
+	// ContentIndex references the index of the content block being updated.
+	ContentIndex *int `json:"contentIndex,omitempty"`
+	// Delta contains the incremental text chunk for text, thinking, or tool calls.
+	Delta string `json:"delta,omitempty"`
+	// Content contains the final full text of the block upon completion.
+	Content string `json:"content,omitempty"`
+	// ToolCall contains the final completed tool call details.
+	ToolCall *ToolCall `json:"toolCall,omitempty"`
+	// Partial contains the intermediate partial assistant message state.
+	Partial *AssistantMessage `json:"partial,omitempty"`
+	// Message contains the final complete assistant message.
+	Message *AssistantMessage `json:"message,omitempty"`
+	// Error contains the assistant message state when an error occurred.
+	Error *AssistantMessage `json:"error,omitempty"`
+	// Reason is the stop reason when the stream completes or errors.
+	Reason StopReason `json:"reason,omitempty"`
+}
