@@ -1877,7 +1877,6 @@ func TestAssistantStreamTerminalPushWhenQueueFull(t *testing.T) {
 	})
 }
 
-
 func TestAssistantStreamEventsAfterResult(t *testing.T) {
 	s := NewAssistantStream(10)
 
@@ -2110,4 +2109,151 @@ func TestRegistry(t *testing.T) {
 	if len(GetApiProviders()) != 0 {
 		t.Error("expected registry to be empty after ClearApiProviders")
 	}
+}
+
+func TestDispatch(t *testing.T) {
+	// Ensure a clean state before starting
+	ClearApiProviders()
+	defer ClearApiProviders()
+
+	testAPI := APIID("test-api")
+	provider := ApiProvider{
+		API: testAPI,
+		Stream: func(ctx context.Context, model Model, c Context, opts *StreamOptions) *AssistantStream {
+			s := NewAssistantStream(10)
+			s.End(&AssistantMessage{ResponseModel: "stream-success", StopReason: StopReasonStop})
+			return s
+		},
+		StreamSimple: func(ctx context.Context, model Model, c Context, opts *SimpleStreamOptions) *AssistantStream {
+			s := NewAssistantStream(10)
+			s.End(&AssistantMessage{ResponseModel: "simple-success", StopReason: StopReasonStop})
+			return s
+		},
+	}
+
+	if err := RegisterApiProvider(provider); err != nil {
+		t.Fatalf("failed to register provider: %v", err)
+	}
+
+	modelMatch := Model{API: testAPI}
+
+	t.Run("Registered Stream", func(t *testing.T) {
+		s := Stream(context.Background(), modelMatch, Context{}, &StreamOptions{})
+		msg, err := s.Result()
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if msg.ResponseModel != "stream-success" {
+			t.Errorf("expected ResponseModel stream-success, got %q", msg.ResponseModel)
+		}
+	})
+
+	t.Run("Registered Complete", func(t *testing.T) {
+		msg, err := Complete(context.Background(), modelMatch, Context{}, &StreamOptions{})
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if msg.ResponseModel != "stream-success" {
+			t.Errorf("expected ResponseModel stream-success, got %q", msg.ResponseModel)
+		}
+	})
+
+	t.Run("Registered StreamSimple", func(t *testing.T) {
+		s := StreamSimple(context.Background(), modelMatch, Context{}, &SimpleStreamOptions{})
+		msg, err := s.Result()
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if msg.ResponseModel != "simple-success" {
+			t.Errorf("expected ResponseModel simple-success, got %q", msg.ResponseModel)
+		}
+	})
+
+	t.Run("Registered CompleteSimple", func(t *testing.T) {
+		msg, err := CompleteSimple(context.Background(), modelMatch, Context{}, &SimpleStreamOptions{})
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if msg.ResponseModel != "simple-success" {
+			t.Errorf("expected ResponseModel simple-success, got %q", msg.ResponseModel)
+		}
+	})
+
+	modelMismatch := Model{API: "missing-api"}
+
+	t.Run("Unregistered Stream", func(t *testing.T) {
+		s := Stream(context.Background(), modelMismatch, Context{}, &StreamOptions{})
+		var errorEventObserved bool
+		for ev := range s.Events() {
+			if ev.Type == EventError {
+				errorEventObserved = true
+				if ev.Reason != StopReasonError {
+					t.Errorf("expected EventError to have reason %q, got %q", StopReasonError, ev.Reason)
+				}
+				if ev.Error == nil {
+					t.Error("expected EventError to have a non-nil Error message object")
+				} else if ev.Error.StopReason != StopReasonError {
+					t.Errorf("expected message StopReasonError, got %q", ev.Error.StopReason)
+				}
+			}
+		}
+		if !errorEventObserved {
+			t.Error("expected error event to be emitted on Events() channel")
+		}
+		msg, err := s.Result()
+		if err == nil {
+			t.Error("expected error for unregistered API, got nil")
+		}
+		if msg.StopReason != StopReasonError {
+			t.Errorf("expected StopReasonError, got %q", msg.StopReason)
+		}
+	})
+
+	t.Run("Unregistered Complete", func(t *testing.T) {
+		msg, err := Complete(context.Background(), modelMismatch, Context{}, &StreamOptions{})
+		if err == nil {
+			t.Error("expected error for unregistered API, got nil")
+		}
+		if msg.StopReason != StopReasonError {
+			t.Errorf("expected StopReasonError, got %q", msg.StopReason)
+		}
+	})
+
+	t.Run("Unregistered StreamSimple", func(t *testing.T) {
+		s := StreamSimple(context.Background(), modelMismatch, Context{}, &SimpleStreamOptions{})
+		var errorEventObserved bool
+		for ev := range s.Events() {
+			if ev.Type == EventError {
+				errorEventObserved = true
+				if ev.Reason != StopReasonError {
+					t.Errorf("expected EventError to have reason %q, got %q", StopReasonError, ev.Reason)
+				}
+				if ev.Error == nil {
+					t.Error("expected EventError to have a non-nil Error message object")
+				} else if ev.Error.StopReason != StopReasonError {
+					t.Errorf("expected message StopReasonError, got %q", ev.Error.StopReason)
+				}
+			}
+		}
+		if !errorEventObserved {
+			t.Error("expected error event to be emitted on Events() channel")
+		}
+		msg, err := s.Result()
+		if err == nil {
+			t.Error("expected error for unregistered API, got nil")
+		}
+		if msg.StopReason != StopReasonError {
+			t.Errorf("expected StopReasonError, got %q", msg.StopReason)
+		}
+	})
+
+	t.Run("Unregistered CompleteSimple", func(t *testing.T) {
+		msg, err := CompleteSimple(context.Background(), modelMismatch, Context{}, &SimpleStreamOptions{})
+		if err == nil {
+			t.Error("expected error for unregistered API, got nil")
+		}
+		if msg.StopReason != StopReasonError {
+			t.Errorf("expected StopReasonError, got %q", msg.StopReason)
+		}
+	})
 }
