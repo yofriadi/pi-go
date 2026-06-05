@@ -34,7 +34,7 @@ func GetSupportedThinkingLevels(model Model) []ModelThinkingLevel {
 		return []ModelThinkingLevel{ModelThinkingLevelOff}
 	}
 
-	var result []ModelThinkingLevel
+	result := make([]ModelThinkingLevel, 0, len(extendedThinkingLevels))
 	for _, level := range extendedThinkingLevels {
 		if model.ThinkingLevelMap != nil {
 			mapped, exists := model.ThinkingLevelMap[level]
@@ -102,11 +102,12 @@ func ClampThinkingLevel(model Model, level ModelThinkingLevel) ModelThinkingLeve
 
 // CalculateCost computes financial costs based on usage.
 func CalculateCost(model Model, usage Usage) UsageCost {
-	var cost UsageCost
-	cost.Input = (model.Cost.Input / 1000000.0) * float64(usage.Input)
-	cost.Output = (model.Cost.Output / 1000000.0) * float64(usage.Output)
-	cost.CacheRead = (model.Cost.CacheRead / 1000000.0) * float64(usage.CacheRead)
-	cost.CacheWrite = (model.Cost.CacheWrite / 1000000.0) * float64(usage.CacheWrite)
+	cost := UsageCost{
+		Input:      (model.Cost.Input / 1000000.0) * float64(usage.Input),
+		Output:     (model.Cost.Output / 1000000.0) * float64(usage.Output),
+		CacheRead:  (model.Cost.CacheRead / 1000000.0) * float64(usage.CacheRead),
+		CacheWrite: (model.Cost.CacheWrite / 1000000.0) * float64(usage.CacheWrite),
+	}
 	cost.Total = cost.Input + cost.Output + cost.CacheRead + cost.CacheWrite
 	return cost
 }
