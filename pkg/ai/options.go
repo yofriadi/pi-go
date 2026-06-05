@@ -8,7 +8,7 @@ import (
 type StreamOptions struct {
 	Temperature               *float64
 	MaxTokens                 *int
-	AccessToken               string // OAuth/subscription bearer token
+	APIKey                    string // OAuth/subscription bearer token; upstream-compatible field name
 	Headers                   map[string]string
 	Transport                 Transport
 	CacheRetention            CacheRetention

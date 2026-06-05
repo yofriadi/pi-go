@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 )
 
 // Message is the interface representing any conversation message.
@@ -13,7 +14,7 @@ type Message interface {
 
 // UserMessage represents a message sent by the user.
 type UserMessage struct {
-	Content   any   `json:"content,omitempty"` // string or []UserContent
+	Content   any   `json:"content"` // string or []UserContent; required
 	Timestamp int64 `json:"timestamp"`         // Unix epoch milliseconds
 }
 
@@ -36,14 +37,13 @@ type AssistantMessage struct {
 	Timestamp     int64                        `json:"timestamp"` // Unix epoch milliseconds
 }
 
-func (m *AssistantMessage) messageRole() Role {
+func (m AssistantMessage) messageRole() Role {
 	return RoleAssistant
 }
 
-// ToolResultMessage represents the result of a tool execution.
 type ToolResultMessage struct {
-	ToolCallID string              `json:"toolCallId,omitempty"`
-	ToolName   string              `json:"toolName,omitempty"`
+	ToolCallID string              `json:"toolCallId"` // required
+	ToolName   string              `json:"toolName"`   // required
 	Content    []ToolResultContent `json:"content,omitempty"`
 	Details    any                 `json:"details,omitempty"`
 	IsError    bool                `json:"isError,omitempty"`
@@ -198,6 +198,9 @@ type AssistantMessageDiagnostic struct {
 
 // MarshalJSON custom JSON implementation
 func (m UserMessage) MarshalJSON() ([]byte, error) {
+	if err := validateUserMessageContent(m.Content); err != nil {
+		return nil, err
+	}
 	type Alias UserMessage
 	return json.Marshal(&struct {
 		Role Role `json:"role"`
@@ -208,10 +211,57 @@ func (m UserMessage) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func validateUserMessageContent(content any) error {
+	switch c := content.(type) {
+	case string:
+		return nil
+	case nil:
+		return fmt.Errorf("invalid UserMessage content: expected string or []UserContent, got nil")
+	case []UserContent:
+		if c == nil {
+			return fmt.Errorf("invalid UserMessage content: expected string or []UserContent, got nil []UserContent")
+		}
+		for i, block := range c {
+			if isNilContentBlock(block) {
+				return fmt.Errorf("invalid UserMessage content: nil block at index %d", i)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid UserMessage content: expected string or []UserContent, got %T", content)
+	}
+}
+
+func validateAssistantMessageContent(content []AssistantContent) error {
+	for i, block := range content {
+		if isNilContentBlock(block) {
+			return fmt.Errorf("invalid AssistantMessage content: nil block at index %d", i)
+		}
+	}
+	return nil
+}
+
+func validateToolResultMessageContent(content []ToolResultContent) error {
+	for i, block := range content {
+		if isNilContentBlock(block) {
+			return fmt.Errorf("invalid ToolResultMessage content: nil block at index %d", i)
+		}
+	}
+	return nil
+}
+
+func isNilContentBlock(block any) bool {
+	if block == nil {
+		return true
+	}
+	v := reflect.ValueOf(block)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
 func (m *UserMessage) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Role      Role            `json:"role"`
-		Content   json.RawMessage `json:"content,omitempty"`
+		Content   json.RawMessage `json:"content"` // content must be present
 		Timestamp int64           `json:"timestamp"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -220,12 +270,10 @@ func (m *UserMessage) UnmarshalJSON(data []byte) error {
 	if raw.Role != RoleUser {
 		return fmt.Errorf("invalid role %q for UserMessage", raw.Role)
 	}
-	m.Timestamp = raw.Timestamp
 	if len(raw.Content) == 0 {
-		m.Content = nil
-		return nil
+		return fmt.Errorf("missing required field \"content\" in UserMessage")
 	}
-
+	m.Timestamp = raw.Timestamp
 	trimmed := bytes.TrimSpace(raw.Content)
 	if len(trimmed) == 0 {
 		m.Content = nil
@@ -245,7 +293,7 @@ func (m *UserMessage) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(raw.Content, &list); err != nil {
 			return err
 		}
-		var blocks []UserContent
+		blocks := make([]UserContent, 0, len(list))
 		for _, item := range list {
 			block, err := unmarshalUserContent(item)
 			if err != nil {
@@ -289,6 +337,9 @@ func unmarshalUserContent(data []byte) (UserContent, error) {
 
 // MarshalJSON custom JSON implementation
 func (m AssistantMessage) MarshalJSON() ([]byte, error) {
+	if err := validateAssistantMessageContent(m.Content); err != nil {
+		return nil, err
+	}
 	type Alias AssistantMessage
 	return json.Marshal(&struct {
 		Role Role `json:"role"`
@@ -365,6 +416,15 @@ func unmarshalAssistantContent(data []byte) (AssistantContent, error) {
 
 // MarshalJSON custom JSON implementation
 func (m ToolResultMessage) MarshalJSON() ([]byte, error) {
+	if m.ToolCallID == "" {
+		return nil, fmt.Errorf("invalid ToolResultMessage: missing required field \"toolCallId\"")
+	}
+	if m.ToolName == "" {
+		return nil, fmt.Errorf("invalid ToolResultMessage: missing required field \"toolName\"")
+	}
+	if err := validateToolResultMessageContent(m.Content); err != nil {
+		return nil, err
+	}
 	type Alias ToolResultMessage
 	return json.Marshal(&struct {
 		Role Role `json:"role"`
@@ -378,8 +438,10 @@ func (m ToolResultMessage) MarshalJSON() ([]byte, error) {
 func (m *ToolResultMessage) UnmarshalJSON(data []byte) error {
 	type Alias ToolResultMessage
 	var raw struct {
-		Role    Role              `json:"role"`
-		Content []json.RawMessage `json:"content,omitempty"`
+		Role       Role              `json:"role"`
+		ToolCallID *string           `json:"toolCallId"` // pointer to detect presence
+		ToolName   *string           `json:"toolName"`   // pointer to detect presence
+		Content    []json.RawMessage `json:"content,omitempty"`
 		*Alias
 	}
 	raw.Alias = (*Alias)(m)
@@ -389,7 +451,14 @@ func (m *ToolResultMessage) UnmarshalJSON(data []byte) error {
 	if raw.Role != RoleToolResult {
 		return fmt.Errorf("invalid role %q for ToolResultMessage", raw.Role)
 	}
-
+	if raw.ToolCallID == nil || *raw.ToolCallID == "" {
+		return fmt.Errorf("missing required field \"toolCallId\" in ToolResultMessage")
+	}
+	if raw.ToolName == nil || *raw.ToolName == "" {
+		return fmt.Errorf("missing required field \"toolName\" in ToolResultMessage")
+	}
+	m.ToolCallID = *raw.ToolCallID
+	m.ToolName = *raw.ToolName
 	if len(raw.Content) > 0 {
 		var blocks []ToolResultContent
 		for _, item := range raw.Content {

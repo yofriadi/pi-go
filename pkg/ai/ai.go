@@ -191,7 +191,7 @@ func unmarshalMessage(data []byte) (Message, error) {
 		if err := json.Unmarshal(data, &msg); err != nil {
 			return nil, err
 		}
-		return &msg, nil
+		return msg, nil
 	case RoleToolResult:
 		var msg ToolResultMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
