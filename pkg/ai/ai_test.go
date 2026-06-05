@@ -326,6 +326,32 @@ func TestContentBlockTypeDiscrimination(t *testing.T) {
 		t.Errorf("expected error for role mismatch, got nil")
 	}
 
+	// Mismatched role for AssistantMessage (role 'user')
+	var asstMsg AssistantMessage
+	mismatchedRoleAsstJSON := `{
+		"role": "user",
+		"content": [{"type": "text", "text": "hello"}],
+		"timestamp": 12345
+	}`
+	err = json.Unmarshal([]byte(mismatchedRoleAsstJSON), &asstMsg)
+	if err == nil {
+		t.Errorf("expected error for AssistantMessage role mismatch, got nil")
+	}
+
+	// Mismatched role for ToolResultMessage (role 'user')
+	var toolMsg ToolResultMessage
+	mismatchedRoleToolJSON := `{
+		"role": "user",
+		"toolCallId": "call-1",
+		"toolName": "search",
+		"content": [{"type": "text", "text": "hello"}],
+		"timestamp": 12345
+	}`
+	err = json.Unmarshal([]byte(mismatchedRoleToolJSON), &toolMsg)
+	if err == nil {
+		t.Errorf("expected error for ToolResultMessage role mismatch, got nil")
+	}
+
 	// Missing role for UserMessage
 	missingRoleJSON := `{
 		"content": "Hello",
@@ -346,6 +372,7 @@ func TestContentBlockTypeDiscrimination(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected error for missing role in AssistantMessage, got nil")
 	}
+
 	// Missing role for ToolResultMessage
 	var toolMsgMissing ToolResultMessage
 	missingRoleToolJSON := `{
@@ -369,11 +396,29 @@ func TestContentBlockTypeDiscrimination(t *testing.T) {
 		],
 		"timestamp": 12345
 	}`
-	var asstMsg AssistantMessage
 	err = json.Unmarshal([]byte(invalidAsstJSON), &asstMsg)
 	if err == nil {
 		t.Errorf("expected error when unmarshalling unknown content block type in AssistantMessage, got nil")
 	}
+
+	// Unknown content block type in ToolResultMessage
+	invalidToolJSON := `{
+		"role": "toolResult",
+		"toolCallId": "call-1",
+		"toolName": "search",
+		"content": [
+			{
+				"type": "unsupported-tool-block",
+				"text": "hi"
+			}
+		],
+		"timestamp": 12345
+	}`
+	err = json.Unmarshal([]byte(invalidToolJSON), &toolMsg)
+	if err == nil {
+		t.Errorf("expected error when unmarshalling unknown content block type in ToolResultMessage, got nil")
+	}
+
 
 	// Verify type of ToolCall in JSON
 	tc := ToolCall{ID: "1", Name: "test", Arguments: map[string]any{}}
@@ -1481,14 +1526,19 @@ func TestAssistantStreamQueueOverflow(t *testing.T) {
 
 	// Wait until the drain loop has popped the first event and is blocked on sending.
 	// We check the queue size under lock in a loop.
+	drained := false
 	for i := 0; i < 100; i++ {
 		s.mu.Lock()
 		qLen := len(s.queue)
 		s.mu.Unlock()
 		if qLen == 0 {
+			drained = true
 			break
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if !drained {
+		t.Fatalf("timed out waiting for drain loop to pop first event")
 	}
 
 	// Now we fill the queue to its limit (2)
@@ -1577,6 +1627,32 @@ func TestAssistantStreamStopReasonPartitioning(t *testing.T) {
 			if err == nil {
 				t.Errorf("expected invalid done reason %q to be rejected, got nil", reason)
 			}
+			s.mu.Lock()
+			qLen := len(s.queue)
+			closed := s.pushClosed
+			s.mu.Unlock()
+			if qLen != 0 {
+				t.Errorf("expected queue to be empty after rejected push, got length %d", qLen)
+			}
+			if closed {
+				t.Errorf("expected pushClosed to remain false after rejected push")
+			}
+			msgDone := AssistantMessage{ResponseModel: "valid-done"}
+			err = s.Push(AssistantMessageEvent{
+				Type:    EventDone,
+				Reason:  StopReasonStop,
+				Message: &msgDone,
+			})
+			if err != nil {
+				t.Errorf("expected stream to still accept valid done reason after rejection, got err: %v", err)
+			}
+			res, err := s.Result()
+			if err != nil {
+				t.Errorf("expected no error from Result(), got %v", err)
+			}
+			if res.ResponseModel != "valid-done" {
+				t.Errorf("expected ResponseModel to be 'valid-done', got %q", res.ResponseModel)
+			}
 		}
 	})
 
@@ -1604,6 +1680,32 @@ func TestAssistantStreamStopReasonPartitioning(t *testing.T) {
 			})
 			if err == nil {
 				t.Errorf("expected invalid error reason %q to be rejected, got nil", reason)
+			}
+			s.mu.Lock()
+			qLen := len(s.queue)
+			closed := s.pushClosed
+			s.mu.Unlock()
+			if qLen != 0 {
+				t.Errorf("expected queue to be empty after rejected push, got length %d", qLen)
+			}
+			if closed {
+				t.Errorf("expected pushClosed to remain false after rejected push")
+			}
+			msgErr := AssistantMessage{ResponseModel: "valid-error", ErrorMessage: "some-error"}
+			err = s.Push(AssistantMessageEvent{
+				Type:   EventError,
+				Reason: StopReasonError,
+				Error:  &msgErr,
+			})
+			if err != nil {
+				t.Errorf("expected stream to still accept valid error reason after rejection, got err: %v", err)
+			}
+			res, err := s.Result()
+			if err == nil {
+				t.Errorf("expected error from Result(), got nil")
+			}
+			if res.ResponseModel != "valid-error" {
+				t.Errorf("expected ResponseModel to be 'valid-error', got %q", res.ResponseModel)
 			}
 		}
 	})
@@ -2027,6 +2129,7 @@ func TestRegistry(t *testing.T) {
 	}
 
 	// B. Mismatch: should return error stream (mismatch guard)
+	originalStreamCalled = false
 	modelMismatch := Model{API: "other-api"}
 	streamMismatch := retrieved.Stream(context.Background(), modelMismatch, Context{}, &StreamOptions{})
 	resMismatch, err := streamMismatch.Result()
@@ -2037,6 +2140,9 @@ func TestRegistry(t *testing.T) {
 	}
 	if resMismatch.StopReason != StopReasonError {
 		t.Errorf("expected stop reason %q, got %q", StopReasonError, resMismatch.StopReason)
+	}
+	if originalStreamCalled {
+		t.Error("expected original Stream function NOT to be called on API mismatch")
 	}
 
 	// Verify that EventError is received via the Events channel
@@ -2066,6 +2172,7 @@ func TestRegistry(t *testing.T) {
 	}
 
 	// B. Mismatch
+	originalStreamSimpleCalled = false
 	streamSimpleMismatch := retrieved.StreamSimple(context.Background(), modelMismatch, Context{}, &SimpleStreamOptions{})
 	resSimpleMismatch, err := streamSimpleMismatch.Result()
 	if err == nil {
@@ -2075,6 +2182,9 @@ func TestRegistry(t *testing.T) {
 	}
 	if resSimpleMismatch.StopReason != StopReasonError {
 		t.Errorf("expected stop reason %q, got %q", StopReasonError, resSimpleMismatch.StopReason)
+	}
+	if originalStreamSimpleCalled {
+		t.Error("expected original StreamSimple function NOT to be called on API mismatch")
 	}
 
 	// 6. Verification of sorting in GetApiProviders
