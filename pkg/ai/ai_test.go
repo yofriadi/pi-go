@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -1921,5 +1922,192 @@ func TestAssistantStreamEventsAfterResult(t *testing.T) {
 		if events[i].Type != typ {
 			t.Errorf("event %d type = %q, want %q", i, events[i].Type, typ)
 		}
+	}
+}
+
+func TestRegistry(t *testing.T) {
+	// Ensure a clean state before starting
+	ClearApiProviders()
+	defer ClearApiProviders()
+
+	// 1. Validation of inputs
+	err := RegisterApiProvider(ApiProvider{
+		API: "",
+	})
+	if err == nil {
+		t.Error("expected error when registering provider with empty API ID")
+	}
+
+	dummyStream := func(ctx context.Context, model Model, c Context, opts *StreamOptions) *AssistantStream {
+		return NewAssistantStream(10)
+	}
+	dummyStreamSimple := func(ctx context.Context, model Model, c Context, opts *SimpleStreamOptions) *AssistantStream {
+		return NewAssistantStream(10)
+	}
+
+	err = RegisterApiProvider(ApiProvider{
+		API:          "test-api",
+		Stream:       nil,
+		StreamSimple: dummyStreamSimple,
+	})
+	if err == nil {
+		t.Error("expected error when registering provider with nil Stream function")
+	}
+
+	err = RegisterApiProvider(ApiProvider{
+		API:          "test-api",
+		Stream:       dummyStream,
+		StreamSimple: nil,
+	})
+	if err == nil {
+		t.Error("expected error when registering provider with nil StreamSimple function")
+	}
+
+	// 2. Successful registration
+	originalStreamCalled := false
+	originalStreamSimpleCalled := false
+
+	testAPI := APIID("test-api")
+	provider := ApiProvider{
+		API: testAPI,
+		Stream: func(ctx context.Context, model Model, c Context, opts *StreamOptions) *AssistantStream {
+			originalStreamCalled = true
+			s := NewAssistantStream(10)
+			s.End(&AssistantMessage{ResponseModel: "stream-success"})
+			return s
+		},
+		StreamSimple: func(ctx context.Context, model Model, c Context, opts *SimpleStreamOptions) *AssistantStream {
+			originalStreamSimpleCalled = true
+			s := NewAssistantStream(10)
+			s.End(&AssistantMessage{ResponseModel: "simple-success"})
+			return s
+		},
+	}
+
+	err = RegisterApiProvider(provider)
+	if err != nil {
+		t.Fatalf("failed to register valid provider: %v", err)
+	}
+
+	// Test duplicate registration
+	err = RegisterApiProvider(provider)
+	if err == nil {
+		t.Error("expected error when registering duplicate API provider, got nil")
+	} else if !strings.Contains(err.Error(), "already registered") {
+		t.Errorf("expected duplicate error message to contain 'already registered', got %q", err.Error())
+	}
+
+	// 3. Retrieval via GetApiProvider
+	retrieved, ok := GetApiProvider(testAPI)
+	if !ok {
+		t.Fatalf("expected to retrieve registered provider %q", testAPI)
+	}
+	if retrieved.API != testAPI {
+		t.Errorf("expected retrieved provider API %q, got %q", testAPI, retrieved.API)
+	}
+
+	// Test unregistered API retrieval
+	_, ok = GetApiProvider("non-existent-api")
+	if ok {
+		t.Error("expected ok=false for non-existent provider")
+	}
+
+	// 4. Verification of API-mismatch guard on retrieved.Stream
+	// A. Match: should call original function
+	modelMatch := Model{API: testAPI}
+	streamMatch := retrieved.Stream(context.Background(), modelMatch, Context{}, &StreamOptions{})
+	resMatch, err := streamMatch.Result()
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if resMatch.ResponseModel != "stream-success" {
+		t.Errorf("expected response model 'stream-success', got %q", resMatch.ResponseModel)
+	}
+	if !originalStreamCalled {
+		t.Error("expected original Stream function to be called")
+	}
+
+	// B. Mismatch: should return error stream (mismatch guard)
+	modelMismatch := Model{API: "other-api"}
+	streamMismatch := retrieved.Stream(context.Background(), modelMismatch, Context{}, &StreamOptions{})
+	resMismatch, err := streamMismatch.Result()
+	if err == nil {
+		t.Error("expected mismatch error, got nil")
+	} else if !strings.Contains(err.Error(), "API mismatch") {
+		t.Errorf("expected mismatch error message to contain 'API mismatch', got %q", err.Error())
+	}
+	if resMismatch.StopReason != StopReasonError {
+		t.Errorf("expected stop reason %q, got %q", StopReasonError, resMismatch.StopReason)
+	}
+
+	// Verify that EventError is received via the Events channel
+	var mismatchEvents []AssistantMessageEvent
+	for ev := range streamMismatch.Events() {
+		mismatchEvents = append(mismatchEvents, ev)
+	}
+	if len(mismatchEvents) != 1 {
+		t.Fatalf("expected 1 event on mismatch stream, got %d", len(mismatchEvents))
+	}
+	if mismatchEvents[0].Type != EventError {
+		t.Errorf("expected EventError, got %s", mismatchEvents[0].Type)
+	}
+
+	// 5. Verification of API-mismatch guard on retrieved.StreamSimple
+	// A. Match
+	streamSimpleMatch := retrieved.StreamSimple(context.Background(), modelMatch, Context{}, &SimpleStreamOptions{})
+	resSimpleMatch, err := streamSimpleMatch.Result()
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if resSimpleMatch.ResponseModel != "simple-success" {
+		t.Errorf("expected response model 'simple-success', got %q", resSimpleMatch.ResponseModel)
+	}
+	if !originalStreamSimpleCalled {
+		t.Error("expected original StreamSimple function to be called")
+	}
+
+	// B. Mismatch
+	streamSimpleMismatch := retrieved.StreamSimple(context.Background(), modelMismatch, Context{}, &SimpleStreamOptions{})
+	resSimpleMismatch, err := streamSimpleMismatch.Result()
+	if err == nil {
+		t.Error("expected mismatch error, got nil")
+	} else if !strings.Contains(err.Error(), "API mismatch") {
+		t.Errorf("expected mismatch error message to contain 'API mismatch', got %q", err.Error())
+	}
+	if resSimpleMismatch.StopReason != StopReasonError {
+		t.Errorf("expected stop reason %q, got %q", StopReasonError, resSimpleMismatch.StopReason)
+	}
+
+	// 6. Verification of sorting in GetApiProviders
+	// Clear and register multiple in non-alphabetical order
+	ClearApiProviders()
+	apisToRegister := []string{"charlie", "alpha", "bravo"}
+	for _, apiName := range apisToRegister {
+		err := RegisterApiProvider(ApiProvider{
+			API:          APIID(apiName),
+			Stream:       dummyStream,
+			StreamSimple: dummyStreamSimple,
+		})
+		if err != nil {
+			t.Fatalf("failed to register provider %q: %v", apiName, err)
+		}
+	}
+
+	allProviders := GetApiProviders()
+	if len(allProviders) != 3 {
+		t.Fatalf("expected 3 registered providers, got %d", len(allProviders))
+	}
+
+	expectedOrder := []string{"alpha", "bravo", "charlie"}
+	for i, expected := range expectedOrder {
+		if string(allProviders[i].API) != expected {
+			t.Errorf("expected provider at index %d to be %q, got %q", i, expected, allProviders[i].API)
+		}
+	}
+
+	// 7. Verification of ClearApiProviders
+	ClearApiProviders()
+	if len(GetApiProviders()) != 0 {
+		t.Error("expected registry to be empty after ClearApiProviders")
 	}
 }
