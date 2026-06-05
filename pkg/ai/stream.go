@@ -144,6 +144,9 @@ func (s *AssistantStream) resolveResultLocked(event AssistantMessageEvent, optEr
 		} else if event.Partial != nil {
 			msg = *event.Partial
 		}
+		if msg.StopReason == "" && event.Reason != "" {
+			msg.StopReason = event.Reason
+		}
 		s.resultMsg = msg
 		s.resultErr = nil
 	} else if event.Type == EventError {
@@ -153,8 +156,10 @@ func (s *AssistantStream) resolveResultLocked(event AssistantMessageEvent, optEr
 		} else if event.Partial != nil {
 			msg = *event.Partial
 		}
+		if msg.StopReason == "" && event.Reason != "" {
+			msg.StopReason = event.Reason
+		}
 		s.resultMsg = msg
-
 		if optErr != nil {
 			s.resultErr = optErr
 		} else if msg.ErrorMessage != "" {
@@ -266,6 +271,10 @@ func (s *AssistantStream) Result() (AssistantMessage, error) {
 // deepCopyEvent creates a deep copy of the event fields to prevent snapshot aliasing.
 func deepCopyEvent(event AssistantMessageEvent) AssistantMessageEvent {
 	copied := event
+	if event.ContentIndex != nil {
+		idx := *event.ContentIndex
+		copied.ContentIndex = &idx
+	}
 	if event.ToolCall != nil {
 		copied.ToolCall = deepCopyToolCall(event.ToolCall)
 	}

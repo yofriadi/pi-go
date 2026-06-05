@@ -2367,3 +2367,87 @@ func TestDispatch(t *testing.T) {
 		}
 	})
 }
+
+func TestAssistantStreamFixes(t *testing.T) {
+	t.Run("StopReason propagation in resolveResultLocked", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		msgPayload := AssistantMessage{
+			ResponseModel: "model-z",
+			StopReason:    "", // empty
+		}
+		err := s.Push(AssistantMessageEvent{
+			Type:    EventDone,
+			Reason:  StopReasonStop,
+			Message: &msgPayload,
+		})
+		if err != nil {
+			t.Fatalf("push failed: %v", err)
+		}
+
+		res, err := s.Result()
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if res.StopReason != StopReasonStop {
+			t.Errorf("expected StopReason to be propagated as %q, got %q", StopReasonStop, res.StopReason)
+		}
+	})
+
+	t.Run("StopReason propagation in resolveResultLocked for EventError", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		msgPayload := AssistantMessage{
+			ResponseModel: "model-err",
+			StopReason:    "", // empty
+		}
+		err := s.Push(AssistantMessageEvent{
+			Type:   EventError,
+			Reason: StopReasonError,
+			Error:  &msgPayload,
+		})
+		if err != nil {
+			t.Fatalf("push failed: %v", err)
+		}
+
+		res, err := s.Result()
+		if err == nil {
+			t.Fatalf("expected non-nil error, got nil")
+		}
+		if res.StopReason != StopReasonError {
+			t.Errorf("expected StopReason to be propagated as %q, got %q", StopReasonError, res.StopReason)
+		}
+	})
+
+	t.Run("ContentIndex deep copy isolation", func(t *testing.T) {
+		s := NewAssistantStream(10)
+		events := s.Events()
+
+		indexVal := 42
+		err := s.Push(AssistantMessageEvent{
+			Type:         EventTextDelta,
+			ContentIndex: &indexVal,
+			Delta:        "test",
+		})
+		if err != nil {
+			t.Fatalf("push failed: %v", err)
+		}
+
+		// Mutate indexVal immediately
+		indexVal = 99
+
+		s.End(nil)
+
+		var ev AssistantMessageEvent
+		for e := range events {
+			if e.Type == EventTextDelta {
+				ev = e
+			}
+		}
+
+		if ev.ContentIndex == nil {
+			t.Fatalf("expected ContentIndex to be non-nil")
+		}
+		if *ev.ContentIndex != 42 {
+			t.Errorf("expected ContentIndex to remain 42, got %d", *ev.ContentIndex)
+		}
+	})
+}
