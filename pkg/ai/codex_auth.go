@@ -90,8 +90,23 @@ func ResolveCodexToken(ctx context.Context) (string, error) {
 	if testBeforeCodexAuthLock != nil {
 		testBeforeCodexAuthLock()
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return "", fmt.Errorf("failed to acquire flock: %w", err)
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
+
+	for {
+		flockErr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if flockErr == nil {
+			break
+		}
+		if flockErr != syscall.EWOULDBLOCK && flockErr != syscall.EAGAIN {
+			return "", fmt.Errorf("failed to acquire flock: %w", flockErr)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+			timer.Reset(10 * time.Millisecond)
+		}
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 

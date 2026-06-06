@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -750,5 +751,49 @@ func TestResolveCodexToken_CorruptAuthJSON(t *testing.T) {
 	}
 	if string(content) != corruptData {
 		t.Errorf("corrupt auth.json was overwritten! Content: %s", string(content))
+	}
+}
+
+func TestResolveCodexToken_CancellableLock(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pi-agent-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("PI_CODING_AGENT_DIR", tempDir)
+
+	authPath := filepath.Join(tempDir, "auth.json")
+	expiredCreds := map[string]*CodexOAuthCredential{
+		"openai-codex": {
+			Type:    "oauth",
+			Access:  "old-access",
+			Refresh: "old-refresh",
+			Expires: time.Now().UnixMilli() - 1000,
+		},
+	}
+	data, _ := json.Marshal(expiredCreds)
+	_ = os.WriteFile(authPath, data, 0o600)
+
+	lockPath := filepath.Join(tempDir, "auth.json.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("failed to open lock file: %v", err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("failed to acquire parent flock: %v", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err = ResolveCodexToken(ctx)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context deadline exceeded or canceled, got: %v", err)
 	}
 }

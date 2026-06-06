@@ -1509,6 +1509,12 @@ func sanitizeError(err error, token string) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
 	msg := err.Error()
 	if token != "" && strings.Contains(msg, token) {
 		msg = strings.ReplaceAll(msg, token, "[REDACTED]")
@@ -1537,11 +1543,20 @@ func parseStreamingJson(partialJson string) map[string]any {
 		return res
 	}
 
-	inString := false
-	escaped := false
-	var stack []rune
+	type jsonStackNode struct {
+		val    rune
+		parent *jsonStackNode
+	}
 
 	runes := []rune(trimmed)
+	inStringAt := make([]bool, len(runes))
+	escapedAt := make([]bool, len(runes))
+	stackAt := make([]*jsonStackNode, len(runes))
+
+	inString := false
+	escaped := false
+	var currentStack *jsonStackNode
+
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		if inString {
@@ -1556,19 +1571,22 @@ func parseStreamingJson(partialJson string) map[string]any {
 			if r == '"' {
 				inString = true
 			} else if r == '{' {
-				stack = append(stack, '{')
+				currentStack = &jsonStackNode{val: '{', parent: currentStack}
 			} else if r == '[' {
-				stack = append(stack, '[')
+				currentStack = &jsonStackNode{val: '[', parent: currentStack}
 			} else if r == '}' {
-				if len(stack) > 0 && stack[len(stack)-1] == '{' {
-					stack = stack[:len(stack)-1]
+				if currentStack != nil && currentStack.val == '{' {
+					currentStack = currentStack.parent
 				}
 			} else if r == ']' {
-				if len(stack) > 0 && stack[len(stack)-1] == '[' {
-					stack = stack[:len(stack)-1]
+				if currentStack != nil && currentStack.val == '[' {
+					currentStack = currentStack.parent
 				}
 			}
 		}
+		inStringAt[i] = inString
+		escapedAt[i] = escaped
+		stackAt[i] = currentStack
 	}
 
 	buildCandidate := func(base string) string {
@@ -1581,12 +1599,14 @@ func parseStreamingJson(partialJson string) map[string]any {
 			}
 			candidate += `"`
 		}
-		for j := len(stack) - 1; j >= 0; j-- {
-			if stack[j] == '{' {
+		curr := currentStack
+		for curr != nil {
+			if curr.val == '{' {
 				candidate += "}"
-			} else if stack[j] == '[' {
+			} else if curr.val == '[' {
 				candidate += "]"
 			}
+			curr = curr.parent
 		}
 		return candidate
 	}
@@ -1602,47 +1622,24 @@ func parseStreamingJson(partialJson string) map[string]any {
 	}
 
 	for k := 1; k <= maxBacktrack; k++ {
-		subRunes := runes[:len(runes)-k]
-		subStr := strings.TrimSpace(string(subRunes))
-		if subStr == "" {
+		lastNonSpaceIdx := len(runes) - k - 1
+		for lastNonSpaceIdx >= 0 {
+			r := runes[lastNonSpaceIdx]
+			if r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+				break
+			}
+			lastNonSpaceIdx--
+		}
+
+		if lastNonSpaceIdx < 0 {
 			break
 		}
 
-		subInString := false
-		subEscaped := false
-		var subStack []rune
+		subInString := inStringAt[lastNonSpaceIdx]
+		subEscaped := escapedAt[lastNonSpaceIdx]
+		subStack := stackAt[lastNonSpaceIdx]
 
-		subRunesTrimmed := []rune(subStr)
-		for i := 0; i < len(subRunesTrimmed); i++ {
-			r := subRunesTrimmed[i]
-			if subInString {
-				if subEscaped {
-					subEscaped = false
-				} else if r == '\\' {
-					subEscaped = true
-				} else if r == '"' {
-					subInString = false
-				}
-			} else {
-				if r == '"' {
-					subInString = true
-				} else if r == '{' {
-					subStack = append(subStack, '{')
-				} else if r == '[' {
-					subStack = append(subStack, '[')
-				} else if r == '}' {
-					if len(subStack) > 0 && subStack[len(subStack)-1] == '{' {
-						subStack = subStack[:len(subStack)-1]
-					}
-				} else if r == ']' {
-					if len(subStack) > 0 && subStack[len(subStack)-1] == '[' {
-						subStack = subStack[:len(subStack)-1]
-					}
-				}
-			}
-		}
-
-		subCandidate := subStr
+		subCandidate := string(runes[:lastNonSpaceIdx+1])
 		if subInString {
 			if subEscaped {
 				if len(subCandidate) > 0 {
@@ -1651,12 +1648,14 @@ func parseStreamingJson(partialJson string) map[string]any {
 			}
 			subCandidate += `"`
 		}
-		for j := len(subStack) - 1; j >= 0; j-- {
-			if subStack[j] == '{' {
+		curr := subStack
+		for curr != nil {
+			if curr.val == '{' {
 				subCandidate += "}"
-			} else if subStack[j] == '[' {
+			} else if curr.val == '[' {
 				subCandidate += "]"
 			}
+			curr = curr.parent
 		}
 
 		if res, ok := tryUnmarshal(subCandidate); ok {

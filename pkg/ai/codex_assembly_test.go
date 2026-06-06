@@ -3,12 +3,17 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseStreamingJson(t *testing.T) {
@@ -89,6 +94,36 @@ func TestStreamOpenAICodexResponses_Success(t *testing.T) {
 	token := makeFakeJWT(t, claims)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify headers
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("Authorization header missing or mismatched: %q", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("ChatGPT-Account-ID") != "acct_123" {
+			t.Errorf("ChatGPT-Account-ID header missing or mismatched: %q", r.Header.Get("ChatGPT-Account-ID"))
+		}
+		if r.Header.Get("Originator") != "pi" {
+			t.Errorf("Originator header missing or mismatched: %q", r.Header.Get("Originator"))
+		}
+		if r.Header.Get("OpenAI-Beta") != "responses=experimental" {
+			t.Errorf("OpenAI-Beta header missing or mismatched: %q", r.Header.Get("OpenAI-Beta"))
+		}
+
+		// Verify body
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read request body: %v", err)
+		}
+		var reqBody map[string]any
+		if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+			t.Errorf("failed to unmarshal request body: %v", err)
+		}
+		if reqBody["model"] != "gpt-5.3-codex-spark" {
+			t.Errorf("unexpected model in request body: %v", reqBody["model"])
+		}
+		if reqBody["stream"] != true {
+			t.Errorf("unexpected stream in request body: %v", reqBody["stream"])
+		}
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 
@@ -518,4 +553,124 @@ func mathAbs(x float64) float64 {
 		return -x
 	}
 	return x
+}
+
+func TestStreamOpenAICodexResponses_AuthFallback(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "pi-assembly-fallback-*")
+	if err != nil {
+		t.Fatalf("failed to create temp: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("PI_CODING_AGENT_DIR", tempDir)
+
+	claims := map[string]any{"chatgpt_account_id": "acct_fallback_999"}
+	token := makeFakeJWT(t, claims)
+
+	// Write auth.json
+	authPath := filepath.Join(tempDir, "auth.json")
+	creds := map[string]any{
+		"openai-codex": map[string]any{
+			"type":    "oauth",
+			"access":  token,
+			"refresh": "refresh-123",
+			"expires": time.Now().UnixMilli() + 3600000,
+		},
+	}
+	data, _ := json.Marshal(creds)
+	_ = os.WriteFile(authPath, data, 0o600)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("Authorization header missing or mismatched: %q", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("ChatGPT-Account-ID") != "acct_fallback_999" {
+			t.Errorf("ChatGPT-Account-ID header missing or mismatched: %q", r.Header.Get("ChatGPT-Account-ID"))
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: {\"type\": \"response.created\", \"response\": {\"id\": \"resp_fallback\"}}\n\n")
+		fmt.Fprint(w, "data: {\"type\": \"response.completed\", \"response\": {\"id\": \"resp_fallback\", \"status\": \"completed\", \"usage\": {\"input_tokens\": 10, \"output_tokens\": 10, \"total_tokens\": 20}}}\n\n")
+	}))
+	defer srv.Close()
+
+	model := testModel(srv.URL)
+	opts := &CodexResponsesOptions{
+		StreamOptions: StreamOptions{
+			APIKey: "", // triggers fallback to auth.json
+		},
+	}
+
+	stream := StreamOpenAICodexResponses(context.Background(), model, Context{}, opts)
+	msg, err := stream.Result()
+	if err != nil {
+		t.Fatalf("unexpected streaming result error: %v", err)
+	}
+
+	if msg.ResponseID != "resp_fallback" {
+		t.Errorf("expected ResponseID to be 'resp_fallback', got %q", msg.ResponseID)
+	}
+}
+
+func TestStreamOpenAICodexResponses_Cancellation(t *testing.T) {
+	claims := map[string]any{"chatgpt_account_id": "acct_123"}
+	token := makeFakeJWT(t, claims)
+
+	// Block channel to control server timing
+	serverBlockChan := make(chan struct{})
+	defer close(serverBlockChan)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		fmt.Fprint(w, "data: {\"type\": \"response.created\", \"response\": {\"id\": \"resp_cancel\"}}\n\n")
+		// Flush headers and initial event
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Keep request open until client cancels/closes, or parent exits
+		select {
+		case <-r.Context().Done():
+		case <-serverBlockChan:
+		}
+	}))
+	defer srv.Close()
+
+	model := testModel(srv.URL)
+	opts := &CodexResponsesOptions{
+		StreamOptions: StreamOptions{
+			APIKey: token,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := StreamOpenAICodexResponses(ctx, model, Context{}, opts)
+
+	// Wait for stream to start and emit EventStart
+	events := stream.Events()
+	ev := <-events
+	if ev.Type != EventStart {
+		t.Fatalf("expected EventStart, got %v", ev.Type)
+	}
+
+	// Cancel the context to abort the stream
+	cancel()
+
+	// Drain remaining events to allow the stream loop to finish
+	for range events {
+	}
+
+	msg, err := stream.Result()
+	if err == nil {
+		t.Fatal("expected error from cancelled stream, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got: %v", err)
+	}
+
+	if msg.StopReason != StopReasonAborted {
+		t.Errorf("expected StopReason to be %q, got %q", StopReasonAborted, msg.StopReason)
+	}
 }
