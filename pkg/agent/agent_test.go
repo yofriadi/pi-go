@@ -601,7 +601,8 @@ func TestAgentAdditionalReviewFindings(t *testing.T) {
 
 		ctx := context.Background()
 		events := agent.Run(ctx, nil)
-		for range events {}
+		for range events {
+		}
 
 		// Should have drained exactly one steering message
 		if len(agent.History) != 2 { // [Steering1, Response]
@@ -726,7 +727,8 @@ func TestAgentAdditionalReviewFindings(t *testing.T) {
 
 		ctx := context.Background()
 		events := agent.Run(ctx, nil)
-		for range events {}
+		for range events {
+		}
 
 		if len(agent.History) != 3 {
 			t.Fatalf("expected history length 3, got %d", len(agent.History))
@@ -778,7 +780,8 @@ func TestAgentAdditionalReviewFindings(t *testing.T) {
 
 		agent := NewAgent(model, reg, Hooks{})
 		events := agent.Run(context.Background(), nil)
-		for range events {}
+		for range events {
+		}
 
 		mu.Lock()
 		defer mu.Unlock()

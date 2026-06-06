@@ -375,7 +375,6 @@ func (a *Agent) Run(ctx context.Context, opts *ai.SimpleStreamOptions) <-chan Ag
 	return eventChan
 }
 
-
 func extractToolCalls(msg ai.AssistantMessage) []ai.ToolCall {
 	var calls []ai.ToolCall
 	for _, content := range msg.Content {

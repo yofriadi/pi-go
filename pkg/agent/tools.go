@@ -6,6 +6,7 @@ import (
 
 	"pi-go/pkg/ai"
 )
+
 // ToolExecutionMode controls whether a tool runs concurrently with other tools in a batch,
 // or if it requires sequential execution.
 type ToolExecutionMode string
