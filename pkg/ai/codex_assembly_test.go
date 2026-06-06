@@ -159,7 +159,8 @@ func TestStreamOpenAICodexResponses_Success(t *testing.T) {
 
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: token,
+			APIKey:    token,
+			Transport: TransportSSE,
 		},
 	}
 
@@ -296,7 +297,8 @@ func TestStreamOpenAICodexResponses_PricingMultipliers(t *testing.T) {
 
 		opts := &CodexResponsesOptions{
 			StreamOptions: StreamOptions{
-				APIKey: token,
+				APIKey:    token,
+				Transport: TransportSSE,
 			},
 			ServiceTier: serviceTier,
 		}
@@ -348,7 +350,8 @@ func TestStreamOpenAICodexResponses_UsageLimitError(t *testing.T) {
 	model := testModel(srv429.URL)
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: token,
+			APIKey:    token,
+			Transport: TransportSSE,
 		},
 	}
 
@@ -368,7 +371,8 @@ func TestStreamOpenAICodexResponses_UsageLimitError(t *testing.T) {
 		model := testModel("http://127.0.0.1:54321")
 		opts := &CodexResponsesOptions{
 			StreamOptions: StreamOptions{
-				APIKey: token,
+				APIKey:    token,
+				Transport: TransportSSE,
 			},
 		}
 		opts.OnPayload = func(payload any, m Model) (any, bool, error) {
@@ -415,7 +419,8 @@ func TestStreamOpenAICodexResponses_CompleteParity(t *testing.T) {
 	model := testModel(srv.URL)
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: token,
+			APIKey:    token,
+			Transport: TransportSSE,
 		},
 	}
 
@@ -470,7 +475,8 @@ func TestStreamOpenAICodexResponses_PreConnectionFailure(t *testing.T) {
 	model := testModel(srv.URL)
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: token,
+			APIKey:    token,
+			Transport: TransportSSE,
 		},
 	}
 
@@ -514,7 +520,8 @@ func TestStreamOpenAICodexResponses_MalformedSSEJson(t *testing.T) {
 	model := testModel(srv.URL)
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: token,
+			APIKey:    token,
+			Transport: TransportSSE,
 		},
 	}
 
@@ -597,7 +604,8 @@ func TestStreamOpenAICodexResponses_AuthFallback(t *testing.T) {
 	model := testModel(srv.URL)
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: "", // triggers fallback to auth.json
+			APIKey:    "", // triggers fallback to auth.json
+			Transport: TransportSSE,
 		},
 	}
 
@@ -641,7 +649,8 @@ func TestStreamOpenAICodexResponses_Cancellation(t *testing.T) {
 	model := testModel(srv.URL)
 	opts := &CodexResponsesOptions{
 		StreamOptions: StreamOptions{
-			APIKey: token,
+			APIKey:    token,
+			Transport: TransportSSE,
 		},
 	}
 

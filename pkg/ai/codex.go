@@ -70,25 +70,60 @@ func StreamOpenAICodexResponses(ctx context.Context, model Model, c Context, opt
 			return
 		}
 
-		eventChan, err := StreamCodexSSE(ctx, model, bodyMap, opts)
-		if err != nil {
-			sanitizedErr := sanitizeError(parseSSEStartError(err), token)
-			output.StopReason = StopReasonError
-			output.ErrorMessage = sanitizedErr.Error()
-			output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
-				Code:     "provider_transport_failure",
-				Message:  sanitizedErr.Error(),
-				Severity: "error",
-			})
-			stream.Error(sanitizedErr, &output)
-			return
+		var eventChan <-chan CodexStreamResult
+		var websocketStarted *bool
+		websocketUsed := false
+
+		transport := TransportAuto
+		if opts != nil && opts.Transport != "" {
+			transport = opts.Transport
+		}
+		var sessionID string
+		if opts != nil {
+			sessionID = opts.SessionID
 		}
 
-		// Initial start event
-		stream.Push(AssistantMessageEvent{
-			Type:    EventStart,
-			Partial: &output,
-		})
+		websocketDisabledForSession := (transport != TransportSSE) && isWebSocketSseFallbackActive(sessionID)
+		if websocketDisabledForSession {
+			recordWebSocketSseFallback(sessionID)
+		}
+
+		if transport != TransportSSE && !websocketDisabledForSession {
+			websocketUsed = true
+			var wsErr error
+			eventChan, websocketStarted, wsErr = StreamCodexWebSocket(ctx, model, bodyMap, opts, &output, stream)
+			if wsErr != nil {
+				recordWebSocketFailure(sessionID, wsErr)
+				output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+					Code:     "provider_transport_failure",
+					Message:  wsErr.Error(),
+					Severity: "error",
+				})
+				websocketUsed = false
+			}
+		}
+
+		if !websocketUsed {
+			var sseErr error
+			eventChan, sseErr = StreamCodexSSE(ctx, model, bodyMap, opts)
+			if sseErr != nil {
+				sanitizedErr := sanitizeError(parseSSEStartError(sseErr), token)
+				output.StopReason = StopReasonError
+				output.ErrorMessage = sanitizedErr.Error()
+				output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+					Code:     "provider_transport_failure",
+					Message:  sanitizedErr.Error(),
+					Severity: "error",
+				})
+				stream.Error(sanitizedErr, &output)
+				return
+			}
+
+			stream.Push(AssistantMessageEvent{
+				Type:    EventStart,
+				Partial: &output,
+			})
+		}
 
 		var currentBlockThinking *ThinkingContent
 		var currentBlockText *TextContent
@@ -96,341 +131,380 @@ func StreamOpenAICodexResponses(ctx context.Context, model Model, c Context, opt
 		var currentBlockPartialJson string
 		var terminalErr error
 
-		for res := range eventChan {
-			if res.Err != nil {
-				if strings.Contains(res.Err.Error(), "invalid Codex SSE JSON") {
-					terminalErr = errors.New("provider stream parse error")
-				} else {
-					terminalErr = sanitizeError(res.Err, token)
-				}
-				break
-			}
-
-			event := res.Event
-			if event == nil {
-				continue
-			}
-
-			switch event.Type {
-			case "response.created":
-				if event.Response != nil {
-					output.ResponseID = event.Response.ID
-				}
-
-			case "response.output_item.added":
-				if event.Item != nil {
-					item := event.Item
-					switch item.Type {
-					case "reasoning":
-						currentBlockThinking = &ThinkingContent{Thinking: ""}
-						output.Content = append(output.Content, currentBlockThinking)
-						idx := len(output.Content) - 1
-						stream.Push(AssistantMessageEvent{
-							Type:         EventThinkingStart,
-							ContentIndex: &idx,
-							Partial:      &output,
+		for {
+			websocketFailedBeforeStart := false
+			for res := range eventChan {
+				if res.Err != nil {
+					if websocketUsed && websocketStarted != nil && !*websocketStarted {
+						recordWebSocketFailure(sessionID, res.Err)
+						output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+							Code:     "provider_transport_failure",
+							Message:  res.Err.Error(),
+							Severity: "error",
 						})
-					case "message":
-						currentBlockText = &TextContent{Text: ""}
-						output.Content = append(output.Content, currentBlockText)
-						idx := len(output.Content) - 1
-						stream.Push(AssistantMessageEvent{
-							Type:         EventTextStart,
-							ContentIndex: &idx,
-							Partial:      &output,
-						})
-					case "function_call":
-						id := fmt.Sprintf("%s|%s", item.CallID, item.ID)
-						currentBlockToolCall = &ToolCall{
-							ID:        id,
-							Name:      item.Name,
-							Arguments: make(map[string]any),
-						}
-						currentBlockPartialJson = item.Arguments
-						output.Content = append(output.Content, currentBlockToolCall)
-						idx := len(output.Content) - 1
-						stream.Push(AssistantMessageEvent{
-							Type:         EventToolCallStart,
-							ContentIndex: &idx,
-							Partial:      &output,
-						})
+						websocketFailedBeforeStart = true
+						break
 					}
-				}
 
-			case "response.reasoning_summary_text.delta":
-				if currentBlockThinking != nil {
-					currentBlockThinking.Thinking += event.Delta
-					idx := len(output.Content) - 1
-					stream.Push(AssistantMessageEvent{
-						Type:         EventThinkingDelta,
-						ContentIndex: &idx,
-						Delta:        event.Delta,
-						Partial:      &output,
-					})
-				}
-
-			case "response.reasoning_summary_part.done":
-				if currentBlockThinking != nil {
-					currentBlockThinking.Thinking += "\n\n"
-					idx := len(output.Content) - 1
-					stream.Push(AssistantMessageEvent{
-						Type:         EventThinkingDelta,
-						ContentIndex: &idx,
-						Delta:        "\n\n",
-						Partial:      &output,
-					})
-				}
-
-			case "response.reasoning_text.delta":
-				if currentBlockThinking != nil {
-					currentBlockThinking.Thinking += event.Delta
-					idx := len(output.Content) - 1
-					stream.Push(AssistantMessageEvent{
-						Type:         EventThinkingDelta,
-						ContentIndex: &idx,
-						Delta:        event.Delta,
-						Partial:      &output,
-					})
-				}
-
-			case "response.output_text.delta", "response.refusal.delta":
-				if currentBlockText != nil {
-					currentBlockText.Text += event.Delta
-					idx := len(output.Content) - 1
-					stream.Push(AssistantMessageEvent{
-						Type:         EventTextDelta,
-						ContentIndex: &idx,
-						Delta:        event.Delta,
-						Partial:      &output,
-					})
-				}
-
-			case "response.function_call_arguments.delta":
-				if currentBlockToolCall != nil {
-					currentBlockPartialJson += event.Delta
-					currentBlockToolCall.Arguments = parseStreamingJson(currentBlockPartialJson)
-					idx := len(output.Content) - 1
-					stream.Push(AssistantMessageEvent{
-						Type:         EventToolCallDelta,
-						ContentIndex: &idx,
-						Delta:        event.Delta,
-						Partial:      &output,
-					})
-				}
-
-			case "response.function_call_arguments.done":
-				if currentBlockToolCall != nil {
-					prevPartialJson := currentBlockPartialJson
-					currentBlockPartialJson = event.Arguments
-					currentBlockToolCall.Arguments = parseStreamingJson(currentBlockPartialJson)
-					if strings.HasPrefix(event.Arguments, prevPartialJson) {
-						delta := event.Arguments[len(prevPartialJson):]
-						if len(delta) > 0 {
-							idx := len(output.Content) - 1
-							stream.Push(AssistantMessageEvent{
-								Type:         EventToolCallDelta,
-								ContentIndex: &idx,
-								Delta:        delta,
-								Partial:      &output,
-							})
-						}
+					if strings.Contains(res.Err.Error(), "invalid Codex SSE JSON") || strings.Contains(res.Err.Error(), "invalid Codex WebSocket JSON") {
+						terminalErr = errors.New("provider stream parse error")
+					} else {
+						terminalErr = sanitizeError(res.Err, token)
 					}
+					break
 				}
 
-			case "response.output_item.done":
-				if event.Item != nil {
-					item := event.Item
-					switch item.Type {
-					case "reasoning":
-						if currentBlockThinking != nil {
-							var summaryParts []string
-							for _, s := range item.Summary {
-								if s.Text != "" {
-									summaryParts = append(summaryParts, s.Text)
-								}
-							}
-							summaryText := strings.Join(summaryParts, "\n\n")
+				event := res.Event
+				if event == nil {
+					continue
+				}
 
-							var contentParts []string
-							for _, c := range item.Content {
-								if c.Text != "" {
-									contentParts = append(contentParts, c.Text)
-								}
-							}
-							contentText := strings.Join(contentParts, "\n\n")
+				switch event.Type {
+				case "response.created":
+					if event.Response != nil {
+						output.ResponseID = event.Response.ID
+					}
 
-							finalThinking := summaryText
-							if finalThinking == "" {
-								finalThinking = contentText
-							}
-							if finalThinking == "" {
-								finalThinking = currentBlockThinking.Thinking
-							}
-							currentBlockThinking.Thinking = finalThinking
-
-							itemBytes, _ := json.Marshal(item)
-							currentBlockThinking.ThinkingSignature = string(itemBytes)
-
+				case "response.output_item.added":
+					if event.Item != nil {
+						item := event.Item
+						switch item.Type {
+						case "reasoning":
+							currentBlockThinking = &ThinkingContent{Thinking: ""}
+							output.Content = append(output.Content, currentBlockThinking)
 							idx := len(output.Content) - 1
 							stream.Push(AssistantMessageEvent{
-								Type:         EventThinkingEnd,
+								Type:         EventThinkingStart,
 								ContentIndex: &idx,
-								Content:      currentBlockThinking.Thinking,
 								Partial:      &output,
 							})
-							currentBlockThinking = nil
-						}
-
-					case "message":
-						if currentBlockText != nil {
-							var textParts []string
-							for _, c := range item.Content {
-								if c.Type == "output_text" {
-									textParts = append(textParts, c.Text)
-								} else if c.Type == "refusal" {
-									textParts = append(textParts, c.Refusal)
-								}
-							}
-							if len(textParts) > 0 {
-								currentBlockText.Text = strings.Join(textParts, "")
-							}
-							currentBlockText.TextSignature = encodeTextSignatureV1(item.ID, item.Phase)
-
+						case "message":
+							currentBlockText = &TextContent{Text: ""}
+							output.Content = append(output.Content, currentBlockText)
 							idx := len(output.Content) - 1
 							stream.Push(AssistantMessageEvent{
-								Type:         EventTextEnd,
+								Type:         EventTextStart,
 								ContentIndex: &idx,
-								Content:      currentBlockText.Text,
 								Partial:      &output,
 							})
-							currentBlockText = nil
-						}
-
-					case "function_call":
-						args := make(map[string]any)
-						if currentBlockToolCall != nil && currentBlockPartialJson != "" {
-							args = parseStreamingJson(currentBlockPartialJson)
-						} else {
-							args = parseStreamingJson(item.Arguments)
-						}
-
-						var toolCall *ToolCall
-						if currentBlockToolCall != nil {
-							currentBlockToolCall.Arguments = args
-							toolCall = currentBlockToolCall
-						} else {
+						case "function_call":
 							id := fmt.Sprintf("%s|%s", item.CallID, item.ID)
-							toolCall = &ToolCall{
+							currentBlockToolCall = &ToolCall{
 								ID:        id,
 								Name:      item.Name,
-								Arguments: args,
+								Arguments: make(map[string]any),
 							}
-							output.Content = append(output.Content, toolCall)
+							currentBlockPartialJson = item.Arguments
+							output.Content = append(output.Content, currentBlockToolCall)
+							idx := len(output.Content) - 1
+							stream.Push(AssistantMessageEvent{
+								Type:         EventToolCallStart,
+								ContentIndex: &idx,
+								Partial:      &output,
+							})
 						}
+					}
 
+				case "response.reasoning_summary_text.delta":
+					if currentBlockThinking != nil {
+						currentBlockThinking.Thinking += event.Delta
 						idx := len(output.Content) - 1
 						stream.Push(AssistantMessageEvent{
-							Type:         EventToolCallEnd,
+							Type:         EventThinkingDelta,
 							ContentIndex: &idx,
-							ToolCall:     toolCall,
+							Delta:        event.Delta,
 							Partial:      &output,
 						})
-						currentBlockToolCall = nil
-						currentBlockPartialJson = ""
-					}
-				}
-
-			case "response.completed":
-				if event.Response != nil {
-					resp := event.Response
-					if resp.ID != "" {
-						output.ResponseID = resp.ID
-					}
-					if resp.Usage != nil {
-						cachedTokens := 0
-						if resp.Usage.InputTokensDetails != nil {
-							cachedTokens = resp.Usage.InputTokensDetails.CachedTokens
-						}
-						output.Usage.Input = resp.Usage.InputTokens - cachedTokens
-						output.Usage.Output = resp.Usage.OutputTokens
-						output.Usage.CacheRead = cachedTokens
-						output.Usage.CacheWrite = 0
-						output.Usage.TotalTokens = resp.Usage.TotalTokens
 					}
 
-					serviceTier := ""
-					if resp.ServiceTier != "" {
-						serviceTier = resp.ServiceTier
-					} else if opts != nil {
-						serviceTier = opts.ServiceTier
+				case "response.reasoning_summary_part.done":
+					if currentBlockThinking != nil {
+						currentBlockThinking.Thinking += "\n\n"
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventThinkingDelta,
+							ContentIndex: &idx,
+							Delta:        "\n\n",
+							Partial:      &output,
+						})
 					}
 
-					multiplier := 1.0
-					switch serviceTier {
-					case "flex":
-						multiplier = 0.5
-					case "priority":
-						if model.ID == "gpt-5.5" {
-							multiplier = 2.5
-						} else {
-							multiplier = 2.0
-						}
+				case "response.reasoning_text.delta":
+					if currentBlockThinking != nil {
+						currentBlockThinking.Thinking += event.Delta
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventThinkingDelta,
+							ContentIndex: &idx,
+							Delta:        event.Delta,
+							Partial:      &output,
+						})
 					}
 
-					cost := CalculateCost(model, output.Usage)
-					cost.Input *= multiplier
-					cost.Output *= multiplier
-					cost.CacheRead *= multiplier
-					cost.CacheWrite *= multiplier
-					cost.Total = cost.Input + cost.Output + cost.CacheRead + cost.CacheWrite
-					output.Usage.Cost = cost
+				case "response.output_text.delta", "response.refusal.delta":
+					if currentBlockText != nil {
+						currentBlockText.Text += event.Delta
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventTextDelta,
+							ContentIndex: &idx,
+							Delta:        event.Delta,
+							Partial:      &output,
+						})
+					}
 
-					output.StopReason = mapStopReason(resp.Status)
-					if output.StopReason == StopReasonStop {
-						hasToolCall := false
-						for _, b := range output.Content {
-							if _, ok := b.(*ToolCall); ok {
-								hasToolCall = true
-								break
+				case "response.function_call_arguments.delta":
+					if currentBlockToolCall != nil {
+						currentBlockPartialJson += event.Delta
+						currentBlockToolCall.Arguments = parseStreamingJson(currentBlockPartialJson)
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventToolCallDelta,
+							ContentIndex: &idx,
+							Delta:        event.Delta,
+							Partial:      &output,
+						})
+					}
+
+				case "response.function_call_arguments.done":
+					if currentBlockToolCall != nil {
+						prevPartialJson := currentBlockPartialJson
+						currentBlockPartialJson = event.Arguments
+						currentBlockToolCall.Arguments = parseStreamingJson(currentBlockPartialJson)
+						if strings.HasPrefix(event.Arguments, prevPartialJson) {
+							delta := event.Arguments[len(prevPartialJson):]
+							if len(delta) > 0 {
+								idx := len(output.Content) - 1
+								stream.Push(AssistantMessageEvent{
+									Type:         EventToolCallDelta,
+									ContentIndex: &idx,
+									Delta:        delta,
+									Partial:      &output,
+								})
 							}
 						}
-						if hasToolCall {
-							output.StopReason = StopReasonToolUse
+					}
+
+				case "response.output_item.done":
+					if event.Item != nil {
+						item := event.Item
+						switch item.Type {
+						case "reasoning":
+							if currentBlockThinking != nil {
+								var summaryParts []string
+								for _, s := range item.Summary {
+									if s.Text != "" {
+										summaryParts = append(summaryParts, s.Text)
+									}
+								}
+								summaryText := strings.Join(summaryParts, "\n\n")
+
+								var contentParts []string
+								for _, c := range item.Content {
+									if c.Text != "" {
+										contentParts = append(contentParts, c.Text)
+									}
+								}
+								contentText := strings.Join(contentParts, "\n\n")
+
+								finalThinking := summaryText
+								if finalThinking == "" {
+									finalThinking = contentText
+								}
+								if finalThinking == "" {
+									finalThinking = currentBlockThinking.Thinking
+								}
+								currentBlockThinking.Thinking = finalThinking
+
+								itemBytes, _ := json.Marshal(item)
+								currentBlockThinking.ThinkingSignature = string(itemBytes)
+
+								idx := len(output.Content) - 1
+								stream.Push(AssistantMessageEvent{
+									Type:         EventThinkingEnd,
+									ContentIndex: &idx,
+									Content:      currentBlockThinking.Thinking,
+									Partial:      &output,
+								})
+								currentBlockThinking = nil
+							}
+
+						case "message":
+							if currentBlockText != nil {
+								var textParts []string
+								for _, c := range item.Content {
+									if c.Type == "output_text" {
+										textParts = append(textParts, c.Text)
+									} else if c.Type == "refusal" {
+										textParts = append(textParts, c.Refusal)
+									}
+								}
+								if len(textParts) > 0 {
+									currentBlockText.Text = strings.Join(textParts, "")
+								}
+								currentBlockText.TextSignature = encodeTextSignatureV1(item.ID, item.Phase)
+
+								idx := len(output.Content) - 1
+								stream.Push(AssistantMessageEvent{
+									Type:         EventTextEnd,
+									ContentIndex: &idx,
+									Content:      currentBlockText.Text,
+									Partial:      &output,
+								})
+								currentBlockText = nil
+							}
+
+						case "function_call":
+							args := make(map[string]any)
+							if currentBlockToolCall != nil && currentBlockPartialJson != "" {
+								args = parseStreamingJson(currentBlockPartialJson)
+							} else {
+								args = parseStreamingJson(item.Arguments)
+							}
+
+							var toolCall *ToolCall
+							if currentBlockToolCall != nil {
+								currentBlockToolCall.Arguments = args
+								toolCall = currentBlockToolCall
+							} else {
+								id := fmt.Sprintf("%s|%s", item.CallID, item.ID)
+								toolCall = &ToolCall{
+									ID:        id,
+									Name:      item.Name,
+									Arguments: args,
+								}
+								output.Content = append(output.Content, toolCall)
+							}
+
+							idx := len(output.Content) - 1
+							stream.Push(AssistantMessageEvent{
+								Type:         EventToolCallEnd,
+								ContentIndex: &idx,
+								ToolCall:     toolCall,
+								Partial:      &output,
+							})
+							currentBlockToolCall = nil
+							currentBlockPartialJson = ""
 						}
 					}
-				}
 
-			case "error":
-				errMsg := parseSafeError(0, event.Code, event.Message, "", 0)
-				terminalErr = errors.New(errMsg)
-
-			case "response.failed":
-				code := ""
-				msg := ""
-				planType := ""
-				var resetsAt int64 = 0
-
-				if event.Response != nil {
-					if event.Response.Error != nil {
-						errPayload := event.Response.Error
-						code = errPayload.Code
-						if code == "" {
-							code = errPayload.Type
+				case "response.completed":
+					if event.Response != nil {
+						resp := event.Response
+						if resp.ID != "" {
+							output.ResponseID = resp.ID
 						}
-						msg = errPayload.Message
-						planType = errPayload.PlanType
-						resetsAt = errPayload.ResetsAt
-					} else if event.Response.IncompleteDetails != nil {
-						msg = fmt.Sprintf("incomplete: %s", event.Response.IncompleteDetails.Reason)
-					}
-				}
-				errMsg := parseSafeError(0, code, msg, planType, resetsAt)
-				terminalErr = errors.New(errMsg)
-			}
+						if resp.Usage != nil {
+							cachedTokens := 0
+							if resp.Usage.InputTokensDetails != nil {
+								cachedTokens = resp.Usage.InputTokensDetails.CachedTokens
+							}
+							output.Usage.Input = resp.Usage.InputTokens - cachedTokens
+							output.Usage.Output = resp.Usage.OutputTokens
+							output.Usage.CacheRead = cachedTokens
+							output.Usage.CacheWrite = 0
+							output.Usage.TotalTokens = resp.Usage.TotalTokens
+						}
 
-			if terminalErr != nil {
-				break
+						serviceTier := ""
+						if resp.ServiceTier != "" {
+							serviceTier = resp.ServiceTier
+						} else if opts != nil {
+							serviceTier = opts.ServiceTier
+						}
+
+						multiplier := 1.0
+						switch serviceTier {
+						case "flex":
+							multiplier = 0.5
+						case "priority":
+							if model.ID == "gpt-5.5" {
+								multiplier = 2.5
+							} else {
+								multiplier = 2.0
+							}
+						}
+
+						cost := CalculateCost(model, output.Usage)
+						cost.Input *= multiplier
+						cost.Output *= multiplier
+						cost.CacheRead *= multiplier
+						cost.CacheWrite *= multiplier
+						cost.Total = cost.Input + cost.Output + cost.CacheRead + cost.CacheWrite
+						output.Usage.Cost = cost
+
+						output.StopReason = mapStopReason(resp.Status)
+						if output.StopReason == StopReasonStop {
+							hasToolCall := false
+							for _, b := range output.Content {
+								if _, ok := b.(*ToolCall); ok {
+									hasToolCall = true
+									break
+								}
+							}
+							if hasToolCall {
+								output.StopReason = StopReasonToolUse
+							}
+						}
+					}
+
+				case "error":
+					errMsg := parseSafeError(0, event.Code, event.Message, "", 0)
+					terminalErr = errors.New(errMsg)
+
+				case "response.failed":
+					code := ""
+					msg := ""
+					planType := ""
+					var resetsAt int64 = 0
+
+					if event.Response != nil {
+						if event.Response.Error != nil {
+							errPayload := event.Response.Error
+							code = errPayload.Code
+							if code == "" {
+								code = errPayload.Type
+							}
+							msg = errPayload.Message
+							planType = errPayload.PlanType
+							resetsAt = errPayload.ResetsAt
+						} else if event.Response.IncompleteDetails != nil {
+							msg = fmt.Sprintf("incomplete: %s", event.Response.IncompleteDetails.Reason)
+						}
+					}
+					errMsg := parseSafeError(0, code, msg, planType, resetsAt)
+					terminalErr = errors.New(errMsg)
+				}
+
+				if terminalErr != nil {
+					break
+				}
+
 			}
+			if websocketFailedBeforeStart {
+				websocketUsed = false
+				var sseErr error
+				eventChan, sseErr = StreamCodexSSE(ctx, model, bodyMap, opts)
+				if sseErr != nil {
+					sanitizedErr := sanitizeError(parseSSEStartError(sseErr), token)
+					output.StopReason = StopReasonError
+					output.ErrorMessage = sanitizedErr.Error()
+					output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+						Code:     "provider_transport_failure",
+						Message:  sanitizedErr.Error(),
+						Severity: "error",
+					})
+					stream.Error(sanitizedErr, &output)
+					return
+				}
+
+				stream.Push(AssistantMessageEvent{
+					Type:    EventStart,
+					Partial: &output,
+				})
+				continue
+			}
+			break
 		}
 
 		if terminalErr != nil {
@@ -461,6 +535,32 @@ func StreamOpenAICodexResponses(ctx context.Context, model Model, c Context, opt
 			})
 			stream.Error(sanitizedErr, &output)
 			return
+		}
+
+		// Save continuation state if completed successfully and using cache
+		useCachedContext := (opts != nil) && (opts.Transport == TransportWebSocketCached || opts.Transport == TransportAuto)
+		if useCachedContext && sessionID != "" && output.ResponseID != "" && terminalErr == nil && ctx.Err() == nil {
+			wsMu.Lock()
+			entry, ok := websocketSessionCache[sessionID]
+			wsMu.Unlock()
+			if ok {
+				responseItems, err := convertResponsesMessages(model, []Message{output})
+				if err == nil {
+					var filteredItems []any
+					for _, item := range responseItems {
+						if t, ok := item["type"].(string); !ok || t != "function_call_output" {
+							filteredItems = append(filteredItems, item)
+						}
+					}
+					entry.mu.Lock()
+					entry.continuation = &cachedWebSocketContinuationState{
+						lastRequestBody:   bodyMap,
+						lastResponseID:    output.ResponseID,
+						lastResponseItems: filteredItems,
+					}
+					entry.mu.Unlock()
+				}
+			}
 		}
 
 		stream.End(&output)
