@@ -22,12 +22,451 @@ type CodexResponsesOptions struct {
 }
 
 // StreamOpenAICodexResponses streams responses from the OpenAI Codex Responses API.
-// Before transport is implemented, it returns a pre-completed error stream.
 func StreamOpenAICodexResponses(ctx context.Context, model Model, c Context, opts *CodexResponsesOptions) *AssistantStream {
 	if model.Provider != ProviderIDOpenAICodex || model.API != APIIDOpenAICodexResponses {
 		return newErrorStream(fmt.Errorf("invalid model provider %q or API %q", model.Provider, model.API))
 	}
-	return newErrorStream(errors.New("transport not implemented"))
+
+	stream := NewAssistantStream(0)
+
+	// Resolve token for error sanitization/redaction
+	var token string
+	if opts != nil && opts.APIKey != "" {
+		token = opts.APIKey
+	} else {
+		// Best-effort resolve
+		token, _ = ResolveCodexToken(ctx)
+	}
+
+	go func() {
+		output := AssistantMessage{
+			Content:  []AssistantContent{},
+			API:      APIIDOpenAICodexResponses,
+			Provider: model.Provider,
+			Model:    model.ID,
+			Usage: Usage{
+				Input:       0,
+				Output:      0,
+				CacheRead:   0,
+				CacheWrite:  0,
+				TotalTokens: 0,
+				Cost:        UsageCost{},
+			},
+			StopReason: StopReasonStop,
+			Timestamp:  time.Now().UnixMilli(),
+		}
+
+		bodyMap, err := buildCodexRequestBody(model, c, opts)
+		if err != nil {
+			sanitizedErr := sanitizeError(err, token)
+			output.StopReason = StopReasonError
+			output.ErrorMessage = sanitizedErr.Error()
+			output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+				Code:     "request_shaping_failure",
+				Message:  sanitizedErr.Error(),
+				Severity: "error",
+			})
+			stream.Error(sanitizedErr, &output)
+			return
+		}
+
+		eventChan, err := StreamCodexSSE(ctx, model, bodyMap, opts)
+		if err != nil {
+			sanitizedErr := sanitizeError(parseSSEStartError(err), token)
+			output.StopReason = StopReasonError
+			output.ErrorMessage = sanitizedErr.Error()
+			output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+				Code:     "provider_transport_failure",
+				Message:  sanitizedErr.Error(),
+				Severity: "error",
+			})
+			stream.Error(sanitizedErr, &output)
+			return
+		}
+
+		// Initial start event
+		stream.Push(AssistantMessageEvent{
+			Type:    EventStart,
+			Partial: &output,
+		})
+
+		var currentBlockThinking *ThinkingContent
+		var currentBlockText *TextContent
+		var currentBlockToolCall *ToolCall
+		var currentBlockPartialJson string
+		var terminalErr error
+
+		for res := range eventChan {
+			if res.Err != nil {
+				if strings.Contains(res.Err.Error(), "invalid Codex SSE JSON") {
+					terminalErr = errors.New("provider stream parse error")
+				} else {
+					terminalErr = sanitizeError(res.Err, token)
+				}
+				break
+			}
+
+			event := res.Event
+			if event == nil {
+				continue
+			}
+
+			switch event.Type {
+			case "response.created":
+				if event.Response != nil {
+					output.ResponseID = event.Response.ID
+				}
+
+			case "response.output_item.added":
+				if event.Item != nil {
+					item := event.Item
+					switch item.Type {
+					case "reasoning":
+						currentBlockThinking = &ThinkingContent{Thinking: ""}
+						output.Content = append(output.Content, currentBlockThinking)
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventThinkingStart,
+							ContentIndex: &idx,
+							Partial:      &output,
+						})
+					case "message":
+						currentBlockText = &TextContent{Text: ""}
+						output.Content = append(output.Content, currentBlockText)
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventTextStart,
+							ContentIndex: &idx,
+							Partial:      &output,
+						})
+					case "function_call":
+						id := fmt.Sprintf("%s|%s", item.CallID, item.ID)
+						currentBlockToolCall = &ToolCall{
+							ID:        id,
+							Name:      item.Name,
+							Arguments: make(map[string]any),
+						}
+						currentBlockPartialJson = item.Arguments
+						output.Content = append(output.Content, currentBlockToolCall)
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventToolCallStart,
+							ContentIndex: &idx,
+							Partial:      &output,
+						})
+					}
+				}
+
+			case "response.reasoning_summary_text.delta":
+				if currentBlockThinking != nil {
+					currentBlockThinking.Thinking += event.Delta
+					idx := len(output.Content) - 1
+					stream.Push(AssistantMessageEvent{
+						Type:         EventThinkingDelta,
+						ContentIndex: &idx,
+						Delta:        event.Delta,
+						Partial:      &output,
+					})
+				}
+
+			case "response.reasoning_summary_part.done":
+				if currentBlockThinking != nil {
+					currentBlockThinking.Thinking += "\n\n"
+					idx := len(output.Content) - 1
+					stream.Push(AssistantMessageEvent{
+						Type:         EventThinkingDelta,
+						ContentIndex: &idx,
+						Delta:        "\n\n",
+						Partial:      &output,
+					})
+				}
+
+			case "response.reasoning_text.delta":
+				if currentBlockThinking != nil {
+					currentBlockThinking.Thinking += event.Delta
+					idx := len(output.Content) - 1
+					stream.Push(AssistantMessageEvent{
+						Type:         EventThinkingDelta,
+						ContentIndex: &idx,
+						Delta:        event.Delta,
+						Partial:      &output,
+					})
+				}
+
+			case "response.output_text.delta", "response.refusal.delta":
+				if currentBlockText != nil {
+					currentBlockText.Text += event.Delta
+					idx := len(output.Content) - 1
+					stream.Push(AssistantMessageEvent{
+						Type:         EventTextDelta,
+						ContentIndex: &idx,
+						Delta:        event.Delta,
+						Partial:      &output,
+					})
+				}
+
+			case "response.function_call_arguments.delta":
+				if currentBlockToolCall != nil {
+					currentBlockPartialJson += event.Delta
+					currentBlockToolCall.Arguments = parseStreamingJson(currentBlockPartialJson)
+					idx := len(output.Content) - 1
+					stream.Push(AssistantMessageEvent{
+						Type:         EventToolCallDelta,
+						ContentIndex: &idx,
+						Delta:        event.Delta,
+						Partial:      &output,
+					})
+				}
+
+			case "response.function_call_arguments.done":
+				if currentBlockToolCall != nil {
+					prevPartialJson := currentBlockPartialJson
+					currentBlockPartialJson = event.Arguments
+					currentBlockToolCall.Arguments = parseStreamingJson(currentBlockPartialJson)
+					if strings.HasPrefix(event.Arguments, prevPartialJson) {
+						delta := event.Arguments[len(prevPartialJson):]
+						if len(delta) > 0 {
+							idx := len(output.Content) - 1
+							stream.Push(AssistantMessageEvent{
+								Type:         EventToolCallDelta,
+								ContentIndex: &idx,
+								Delta:        delta,
+								Partial:      &output,
+							})
+						}
+					}
+				}
+
+			case "response.output_item.done":
+				if event.Item != nil {
+					item := event.Item
+					switch item.Type {
+					case "reasoning":
+						if currentBlockThinking != nil {
+							var summaryParts []string
+							for _, s := range item.Summary {
+								if s.Text != "" {
+									summaryParts = append(summaryParts, s.Text)
+								}
+							}
+							summaryText := strings.Join(summaryParts, "\n\n")
+
+							var contentParts []string
+							for _, c := range item.Content {
+								if c.Text != "" {
+									contentParts = append(contentParts, c.Text)
+								}
+							}
+							contentText := strings.Join(contentParts, "\n\n")
+
+							finalThinking := summaryText
+							if finalThinking == "" {
+								finalThinking = contentText
+							}
+							if finalThinking == "" {
+								finalThinking = currentBlockThinking.Thinking
+							}
+							currentBlockThinking.Thinking = finalThinking
+
+							itemBytes, _ := json.Marshal(item)
+							currentBlockThinking.ThinkingSignature = string(itemBytes)
+
+							idx := len(output.Content) - 1
+							stream.Push(AssistantMessageEvent{
+								Type:         EventThinkingEnd,
+								ContentIndex: &idx,
+								Content:      currentBlockThinking.Thinking,
+								Partial:      &output,
+							})
+							currentBlockThinking = nil
+						}
+
+					case "message":
+						if currentBlockText != nil {
+							var textParts []string
+							for _, c := range item.Content {
+								if c.Type == "output_text" {
+									textParts = append(textParts, c.Text)
+								} else if c.Type == "refusal" {
+									textParts = append(textParts, c.Refusal)
+								}
+							}
+							if len(textParts) > 0 {
+								currentBlockText.Text = strings.Join(textParts, "")
+							}
+							currentBlockText.TextSignature = encodeTextSignatureV1(item.ID, item.Phase)
+
+							idx := len(output.Content) - 1
+							stream.Push(AssistantMessageEvent{
+								Type:         EventTextEnd,
+								ContentIndex: &idx,
+								Content:      currentBlockText.Text,
+								Partial:      &output,
+							})
+							currentBlockText = nil
+						}
+
+					case "function_call":
+						args := make(map[string]any)
+						if currentBlockToolCall != nil && currentBlockPartialJson != "" {
+							args = parseStreamingJson(currentBlockPartialJson)
+						} else {
+							args = parseStreamingJson(item.Arguments)
+						}
+
+						var toolCall *ToolCall
+						if currentBlockToolCall != nil {
+							currentBlockToolCall.Arguments = args
+							toolCall = currentBlockToolCall
+						} else {
+							id := fmt.Sprintf("%s|%s", item.CallID, item.ID)
+							toolCall = &ToolCall{
+								ID:        id,
+								Name:      item.Name,
+								Arguments: args,
+							}
+							output.Content = append(output.Content, toolCall)
+						}
+
+						idx := len(output.Content) - 1
+						stream.Push(AssistantMessageEvent{
+							Type:         EventToolCallEnd,
+							ContentIndex: &idx,
+							ToolCall:     toolCall,
+							Partial:      &output,
+						})
+						currentBlockToolCall = nil
+						currentBlockPartialJson = ""
+					}
+				}
+
+			case "response.completed":
+				if event.Response != nil {
+					resp := event.Response
+					if resp.ID != "" {
+						output.ResponseID = resp.ID
+					}
+					if resp.Usage != nil {
+						cachedTokens := 0
+						if resp.Usage.InputTokensDetails != nil {
+							cachedTokens = resp.Usage.InputTokensDetails.CachedTokens
+						}
+						output.Usage.Input = resp.Usage.InputTokens - cachedTokens
+						output.Usage.Output = resp.Usage.OutputTokens
+						output.Usage.CacheRead = cachedTokens
+						output.Usage.CacheWrite = 0
+						output.Usage.TotalTokens = resp.Usage.TotalTokens
+					}
+
+					serviceTier := ""
+					if resp.ServiceTier != "" {
+						serviceTier = resp.ServiceTier
+					} else if opts != nil {
+						serviceTier = opts.ServiceTier
+					}
+
+					multiplier := 1.0
+					switch serviceTier {
+					case "flex":
+						multiplier = 0.5
+					case "priority":
+						if model.ID == "gpt-5.5" {
+							multiplier = 2.5
+						} else {
+							multiplier = 2.0
+						}
+					}
+
+					cost := CalculateCost(model, output.Usage)
+					cost.Input *= multiplier
+					cost.Output *= multiplier
+					cost.CacheRead *= multiplier
+					cost.CacheWrite *= multiplier
+					cost.Total = cost.Input + cost.Output + cost.CacheRead + cost.CacheWrite
+					output.Usage.Cost = cost
+
+					output.StopReason = mapStopReason(resp.Status)
+					if output.StopReason == StopReasonStop {
+						hasToolCall := false
+						for _, b := range output.Content {
+							if _, ok := b.(*ToolCall); ok {
+								hasToolCall = true
+								break
+							}
+						}
+						if hasToolCall {
+							output.StopReason = StopReasonToolUse
+						}
+					}
+				}
+
+			case "error":
+				errMsg := parseSafeError(0, event.Code, event.Message, "", 0)
+				terminalErr = errors.New(errMsg)
+
+			case "response.failed":
+				code := ""
+				msg := ""
+				planType := ""
+				var resetsAt int64 = 0
+
+				if event.Response != nil {
+					if event.Response.Error != nil {
+						errPayload := event.Response.Error
+						code = errPayload.Code
+						if code == "" {
+							code = errPayload.Type
+						}
+						msg = errPayload.Message
+						planType = errPayload.PlanType
+						resetsAt = errPayload.ResetsAt
+					} else if event.Response.IncompleteDetails != nil {
+						msg = fmt.Sprintf("incomplete: %s", event.Response.IncompleteDetails.Reason)
+					}
+				}
+				errMsg := parseSafeError(0, code, msg, planType, resetsAt)
+				terminalErr = errors.New(errMsg)
+			}
+
+			if terminalErr != nil {
+				break
+			}
+		}
+
+		if terminalErr != nil {
+			sanitizedErr := sanitizeError(terminalErr, token)
+			output.StopReason = StopReasonError
+			if errors.Is(ctx.Err(), context.Canceled) {
+				output.StopReason = StopReasonAborted
+			}
+			output.ErrorMessage = sanitizedErr.Error()
+			output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+				Code:     "stream_processing_failure",
+				Message:  sanitizedErr.Error(),
+				Severity: "error",
+			})
+			stream.Error(sanitizedErr, &output)
+			return
+		}
+
+		// Verify if context was cancelled during streaming
+		if ctx.Err() != nil {
+			sanitizedErr := sanitizeError(ctx.Err(), token)
+			output.StopReason = StopReasonAborted
+			output.ErrorMessage = sanitizedErr.Error()
+			output.Diagnostics = append(output.Diagnostics, AssistantMessageDiagnostic{
+				Code:     "context_cancelled",
+				Message:  sanitizedErr.Error(),
+				Severity: "error",
+			})
+			stream.Error(sanitizedErr, &output)
+			return
+		}
+
+		stream.End(&output)
+	}()
+
+	return stream
 }
 
 // StreamSimpleOpenAICodexResponses streams responses using SimpleStreamOptions.
@@ -954,4 +1393,276 @@ func buildCodexRequestBody(model Model, context Context, opts *CodexResponsesOpt
 	}
 
 	return body, nil
+}
+
+func mapStopReason(status string) StopReason {
+	switch status {
+	case "completed":
+		return StopReasonStop
+	case "incomplete":
+		return StopReasonLength
+	case "failed", "cancelled":
+		return StopReasonError
+	case "in_progress", "queued":
+		return StopReasonStop
+	default:
+		return StopReasonStop
+	}
+}
+
+func encodeTextSignatureV1(id string, phase string) string {
+	type TextSig struct {
+		V     int    `json:"v"`
+		ID    string `json:"id"`
+		Phase string `json:"phase,omitempty"`
+	}
+	payload := TextSig{
+		V:  1,
+		ID: id,
+	}
+	if phase != "" {
+		payload.Phase = phase
+	}
+	bytes, _ := json.Marshal(payload)
+	return string(bytes)
+}
+
+func parseSafeError(status int, code, msg, planType string, resetsAt int64) string {
+	codeLower := strings.ToLower(code)
+	isUsageLimit := status == 429 ||
+		strings.Contains(codeLower, "usage_limit_reached") ||
+		strings.Contains(codeLower, "usage_not_included") ||
+		strings.Contains(codeLower, "rate_limit_exceeded") ||
+		(code != "" && terminalErrorRx.MatchString(code)) ||
+		(msg != "" && terminalErrorRx.MatchString(msg))
+
+	if isUsageLimit {
+		plan := ""
+		if planType != "" {
+			plan = " (" + strings.ToLower(planType) + " plan)"
+		}
+		when := ""
+		if resetsAt > 0 {
+			mins := (resetsAt*1000 - time.Now().UnixMilli()) / 60000
+			if mins < 0 {
+				mins = 0
+			}
+			when = fmt.Sprintf(" Try again in ~%d min.", mins)
+		}
+		return fmt.Sprintf("You have hit your ChatGPT usage limit%s.%s", plan, when)
+	}
+
+	// For non-friendly mapped provider errors, return a stable safe message.
+	if code != "" {
+		return fmt.Sprintf("provider error: %s", code)
+	}
+	if status > 0 {
+		return fmt.Sprintf("HTTP error %d", status)
+	}
+	return "provider error"
+}
+
+func parseSSEStartError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.HasPrefix(msg, "HTTP error ") {
+		parts := strings.SplitN(strings.TrimPrefix(msg, "HTTP error "), ": ", 2)
+		if len(parts) == 2 {
+			statusStr := parts[0]
+			bodyText := parts[1]
+			var status int
+			if _, scanErr := fmt.Sscanf(statusStr, "%d", &status); scanErr == nil {
+				// 1. Try to parse as JSON first
+				type ErrorDetails struct {
+					Code     string `json:"code"`
+					Type     string `json:"type"`
+					Message  string `json:"message"`
+					PlanType string `json:"plan_type"`
+					ResetsAt int64  `json:"resets_at"`
+				}
+				type ErrorWrapper struct {
+					Error *ErrorDetails `json:"error"`
+				}
+				var wrapper ErrorWrapper
+				if jsonErr := json.Unmarshal([]byte(bodyText), &wrapper); jsonErr == nil && wrapper.Error != nil {
+					e := wrapper.Error
+					errCode := e.Code
+					if errCode == "" {
+						errCode = e.Type
+					}
+					friendly := parseSafeError(status, errCode, e.Message, e.PlanType, e.ResetsAt)
+					return errors.New(friendly)
+				}
+
+				// 2. Not JSON, or unmarshal failed. Apply friendly parsing to raw bodyText.
+				friendly := parseSafeError(status, "", bodyText, "", 0)
+				return errors.New(friendly)
+			}
+		}
+	}
+	return err
+}
+
+func sanitizeError(err error, token string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if token != "" && strings.Contains(msg, token) {
+		msg = strings.ReplaceAll(msg, token, "[REDACTED]")
+	}
+	return errors.New(msg)
+}
+
+func parseStreamingJson(partialJson string) map[string]any {
+	trimmed := strings.TrimSpace(partialJson)
+	if trimmed == "" {
+		return make(map[string]any)
+	}
+
+	tryUnmarshal := func(s string) (map[string]any, bool) {
+		var res map[string]any
+		if err := json.Unmarshal([]byte(s), &res); err == nil {
+			if res == nil {
+				return make(map[string]any), true
+			}
+			return res, true
+		}
+		return nil, false
+	}
+
+	if res, ok := tryUnmarshal(trimmed); ok {
+		return res
+	}
+
+	inString := false
+	escaped := false
+	var stack []rune
+
+	runes := []rune(trimmed)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if r == '\\' {
+				escaped = true
+			} else if r == '"' {
+				inString = false
+			}
+		} else {
+			if r == '"' {
+				inString = true
+			} else if r == '{' {
+				stack = append(stack, '{')
+			} else if r == '[' {
+				stack = append(stack, '[')
+			} else if r == '}' {
+				if len(stack) > 0 && stack[len(stack)-1] == '{' {
+					stack = stack[:len(stack)-1]
+				}
+			} else if r == ']' {
+				if len(stack) > 0 && stack[len(stack)-1] == '[' {
+					stack = stack[:len(stack)-1]
+				}
+			}
+		}
+	}
+
+	buildCandidate := func(base string) string {
+		candidate := base
+		if inString {
+			if escaped {
+				if len(candidate) > 0 {
+					candidate = candidate[:len(candidate)-1]
+				}
+			}
+			candidate += `"`
+		}
+		for j := len(stack) - 1; j >= 0; j-- {
+			if stack[j] == '{' {
+				candidate += "}"
+			} else if stack[j] == '[' {
+				candidate += "]"
+			}
+		}
+		return candidate
+	}
+
+	candidate := buildCandidate(trimmed)
+	if res, ok := tryUnmarshal(candidate); ok {
+		return res
+	}
+
+	maxBacktrack := 100
+	if len(runes) < maxBacktrack {
+		maxBacktrack = len(runes)
+	}
+
+	for k := 1; k <= maxBacktrack; k++ {
+		subRunes := runes[:len(runes)-k]
+		subStr := strings.TrimSpace(string(subRunes))
+		if subStr == "" {
+			break
+		}
+
+		subInString := false
+		subEscaped := false
+		var subStack []rune
+
+		subRunesTrimmed := []rune(subStr)
+		for i := 0; i < len(subRunesTrimmed); i++ {
+			r := subRunesTrimmed[i]
+			if subInString {
+				if subEscaped {
+					subEscaped = false
+				} else if r == '\\' {
+					subEscaped = true
+				} else if r == '"' {
+					subInString = false
+				}
+			} else {
+				if r == '"' {
+					subInString = true
+				} else if r == '{' {
+					subStack = append(subStack, '{')
+				} else if r == '[' {
+					subStack = append(subStack, '[')
+				} else if r == '}' {
+					if len(subStack) > 0 && subStack[len(subStack)-1] == '{' {
+						subStack = subStack[:len(subStack)-1]
+					}
+				} else if r == ']' {
+					if len(subStack) > 0 && subStack[len(subStack)-1] == '[' {
+						subStack = subStack[:len(subStack)-1]
+					}
+				}
+			}
+		}
+
+		subCandidate := subStr
+		if subInString {
+			if subEscaped {
+				if len(subCandidate) > 0 {
+					subCandidate = subCandidate[:len(subCandidate)-1]
+				}
+			}
+			subCandidate += `"`
+		}
+		for j := len(subStack) - 1; j >= 0; j-- {
+			if subStack[j] == '{' {
+				subCandidate += "}"
+			} else if subStack[j] == '[' {
+				subCandidate += "]"
+			}
+		}
+
+		if res, ok := tryUnmarshal(subCandidate); ok {
+			return res
+		}
+	}
+
+	return make(map[string]any)
 }

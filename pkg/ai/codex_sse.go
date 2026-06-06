@@ -159,7 +159,7 @@ func processSSEData(dataBytes []byte, eventChan chan<- CodexStreamResult) bool {
 
 	var ev CodexResponseStreamEvent
 	if err := json.Unmarshal([]byte(dataStr), &ev); err != nil {
-		eventChan <- CodexStreamResult{Err: fmt.Errorf("invalid Codex SSE JSON: %w (payload: %s)", err, dataStr)}
+		eventChan <- CodexStreamResult{Err: fmt.Errorf("invalid Codex SSE JSON: %w", err)}
 		return true
 	}
 	ev.Raw = []byte(dataStr)

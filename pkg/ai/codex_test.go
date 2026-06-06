@@ -66,6 +66,7 @@ func TestRegisterBuiltinProviders_Dispatch(t *testing.T) {
 	if !ok {
 		t.Fatal("failed to get gpt-5.3-codex-spark from registry")
 	}
+	validModel.BaseURL = "http://127.0.0.1:54321"
 
 	ctx := context.Background()
 
@@ -74,8 +75,6 @@ func TestRegisterBuiltinProviders_Dispatch(t *testing.T) {
 	_, err = s.Result()
 	if err == nil {
 		t.Error("expected stream result error, got nil")
-	} else if !strings.Contains(err.Error(), "transport not implemented") {
-		t.Errorf("expected 'transport not implemented', got %v", err)
 	}
 
 	// 2. Dispatch StreamSimple (routed to StreamSimpleOpenAICodexResponses)
@@ -83,8 +82,6 @@ func TestRegisterBuiltinProviders_Dispatch(t *testing.T) {
 	_, err = sSimple.Result()
 	if err == nil {
 		t.Error("expected stream simple result error, got nil")
-	} else if !strings.Contains(err.Error(), "transport not implemented") {
-		t.Errorf("expected 'transport not implemented', got %v", err)
 	}
 }
 
@@ -122,17 +119,16 @@ func TestStreamOpenAICodexResponses_Validation(t *testing.T) {
 		t.Errorf("expected error containing 'invalid model provider', got: %v", err)
 	}
 
-	// 3. Valid model (returns transport not implemented)
+	// 3. Valid model (returns transport/connection failure)
 	validModel, ok := GetModel("gpt-5.3-codex-spark")
 	if !ok {
 		t.Fatal("failed to get gpt-5.3-codex-spark from registry")
 	}
+	validModel.BaseURL = "http://127.0.0.1:54321"
 	s3 := StreamOpenAICodexResponses(ctx, validModel, Context{}, nil)
 	_, err = s3.Result()
 	if err == nil {
-		t.Error("expected error for transport not implemented, got nil")
-	} else if !strings.Contains(err.Error(), "transport not implemented") {
-		t.Errorf("expected error containing 'transport not implemented', got: %v", err)
+		t.Error("expected error for transport failure, got nil")
 	}
 }
 
@@ -170,17 +166,16 @@ func TestStreamSimpleOpenAICodexResponses_Validation(t *testing.T) {
 		t.Errorf("expected error containing 'invalid model provider', got: %v", err)
 	}
 
-	// 3. Valid model (returns transport not implemented)
+	// 3. Valid model (returns transport/connection failure)
 	validModel, ok := GetModel("gpt-5.3-codex-spark")
 	if !ok {
 		t.Fatal("failed to get gpt-5.3-codex-spark from registry")
 	}
+	validModel.BaseURL = "http://127.0.0.1:54321"
 	s3 := StreamSimpleOpenAICodexResponses(ctx, validModel, Context{}, nil)
 	_, err = s3.Result()
 	if err == nil {
-		t.Error("expected error for transport not implemented, got nil")
-	} else if !strings.Contains(err.Error(), "transport not implemented") {
-		t.Errorf("expected error containing 'transport not implemented', got: %v", err)
+		t.Error("expected error for transport failure, got nil")
 	}
 }
 
