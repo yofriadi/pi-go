@@ -705,7 +705,12 @@ func TestBuildCodexHeaders(t *testing.T) {
 	if headers1["OpenAI-Beta"] != "responses=experimental" {
 		t.Errorf("expected OpenAI-Beta responses=experimental, got %q", headers1["OpenAI-Beta"])
 	}
-
+	if headers1["Accept"] != "text/event-stream" {
+		t.Errorf("expected Accept text/event-stream, got %q", headers1["Accept"])
+	}
+	if headers1["Content-Type"] != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", headers1["Content-Type"])
+	}
 	// 2. Without account ID, non-SSE, default User-Agent
 	headers2 := BuildCodexHeaders("my-token-2", "", "", false)
 	if headers2["Authorization"] != "Bearer my-token-2" {
@@ -719,6 +724,12 @@ func TestBuildCodexHeaders(t *testing.T) {
 	}
 	if _, ok := headers2["OpenAI-Beta"]; ok {
 		t.Errorf("did not expect OpenAI-Beta")
+	}
+	if _, ok := headers2["Accept"]; ok {
+		t.Errorf("did not expect Accept")
+	}
+	if headers2["Content-Type"] != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", headers2["Content-Type"])
 	}
 }
 

@@ -203,6 +203,7 @@ func BuildCodexHeaders(token, accountID, userAgent string, sse bool) map[string]
 		"Authorization": "Bearer " + token,
 		"originator":    "pi",
 		"User-Agent":    "pi-go/0.1.0",
+		"Content-Type":  "application/json",
 	}
 	if userAgent != "" {
 		headers["User-Agent"] = userAgent
@@ -212,6 +213,7 @@ func BuildCodexHeaders(token, accountID, userAgent string, sse bool) map[string]
 	}
 	if sse {
 		headers["OpenAI-Beta"] = "responses=experimental"
+		headers["Accept"] = "text/event-stream"
 	}
 	return headers
 }
